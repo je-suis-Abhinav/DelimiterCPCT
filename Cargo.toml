@@ -1,0 +1,14 @@
+[package]
+name = "DelimiterCPCT"
+version = "0.1.0"
+edition = "2024"
+
+[build-dependencies]
+cfgrammar = "0.15.0"
+lrlex = "0.15.0"
+lrpar = "0.15.0"
+
+[dependencies]
+cfgrammar = "0.15.0"
+lrlex = "0.15.0"
+lrpar = "0.15.0"
