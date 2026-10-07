@@ -7,6 +7,7 @@ use DelimiterCPCT::{
 
 fn main() {
     let mut run_benchmark = false;
+    let mut run_benchmark_summary = false;
     let mut observe = false;
     let mut show_recovery_stats = false;
     let mut delimiter_dominance = false;
@@ -15,6 +16,10 @@ fn main() {
         .filter(|arg| match arg.as_str() {
             "--benchmark" => {
                 run_benchmark = true;
+                false
+            }
+            "--benchmark-summary" => {
+                run_benchmark_summary = true;
                 false
             }
             "--observe-delimiters" => {
@@ -33,6 +38,10 @@ fn main() {
         })
         .collect::<Vec<_>>()
         .join(" ");
+    if run_benchmark_summary {
+        print!("{}", DelimiterCPCT::benchmark::benchmark_summary_tsv());
+        return;
+    }
     if run_benchmark {
         print!("{}", DelimiterCPCT::benchmark::benchmark_tsv());
         return;

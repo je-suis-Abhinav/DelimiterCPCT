@@ -51,6 +51,7 @@ cargo run -- --observe-delimiters "((1+2)*3"
 cargo run -- --recovery-stats "1+*"
 cargo run -- --delimiter-dominance --recovery-stats "1+*"
 cargo run --release -- --benchmark > cpct-benchmark.tsv
+cargo run --release -- --benchmark-summary
 ```
 
 The program prints whether parsing succeeded, recovered through baseline CPCT+,
@@ -81,6 +82,13 @@ but not braces/brackets, so those rows can include lexer errors and delimiter
 observations without CPCT+ recovery metrics. Runtime fields are measured values,
 not deterministic test fixtures; use the same build profile and machine when
 comparing runs.
+
+`--benchmark-summary` runs the same corpus/modes and prints a compact TSV
+comparison. Reduction percentages are `(OFF - ON) / OFF * 100`; runtime change
+is `(ON - OFF) / OFF * 100` (positive means ON took longer). Exact OFF/ON
+generated, popped, runtime, cost, repair-count, and dominance-discard values
+are included alongside the percentages. `N/A` marks absent measurements or a
+zero OFF denominator, for which a percentage is undefined.
 
 ## Delimiter Observation
 
