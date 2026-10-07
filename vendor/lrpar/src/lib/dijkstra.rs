@@ -16,12 +16,13 @@ use super::parser::RecoveryStats;
 /// The name of this function isn't entirely accurate: this isn't Dijkstra's original algorithm or
 /// one of its well-known variants. However, unlike the astar_all function it doesn't expect a
 /// heuristic and it also filters out some duplicates.
-pub(crate) fn dijkstra<N, FM, FN, FS, FScore>(
-    start_node: N,
+pub(crate) fn dijkstra<N, FM, FN, FS, FScore, FD>(
+    mut start_node: N,
     neighbours: FN,
     merge: FM,
     success: FS,
     delimiter_score: FScore,
+    mut retain_nondominated: FD,
     stats: &mut RecoveryStats,
 ) -> Vec<N>
 where
@@ -30,7 +31,9 @@ where
     FM: Fn(&mut N, N, &mut RecoveryStats),
     FS: Fn(&N) -> bool,
     FScore: Fn(&N) -> i64,
+    FD: FnMut(&mut N, u16, &mut RecoveryStats) -> bool,
 {
+    retain_nondominated(&mut start_node, 0, stats);
     let mut scs_nodes = Vec::new();
     let mut todo: Vec<IndexMap<N, N>> = vec![indexmap![start_node.clone() => start_node]];
     let mut c: u16 = 0;
@@ -64,6 +67,10 @@ where
         }
         for (nbr_cost, nbr) in next.drain(..) {
             stats.configurations_generated += 1;
+            let mut nbr = nbr;
+            if !retain_nondominated(&mut nbr, nbr_cost, stats) {
+                continue;
+            }
             let off = usize::from(nbr_cost);
             todo.resize(todo.len() + off + 1, IndexMap::new());
             match todo[off].entry(nbr.clone()) {
@@ -108,6 +115,10 @@ where
         }
         for (nbr_cost, nbr) in next.drain(..) {
             stats.configurations_generated += 1;
+            let mut nbr = nbr;
+            if !retain_nondominated(&mut nbr, nbr_cost, stats) {
+                continue;
+            }
             if nbr_cost == c {
                 match scs_todo.entry(nbr.clone()) {
                     Entry::Vacant(e) => {

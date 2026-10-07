@@ -1252,7 +1252,7 @@ where
             YaccKind::Original(YaccOriginalActionKind::GenericParseTree) => {
                 quote! {
                     ::lrpar::RTParserBuilder::new(grm, stable)
-                        .recoverer(#recoverer)
+                        .recoverer(recovery_kind)
                         .parse_map(
                             lexer,
                             &|lexeme| Node::Term{lexeme},
@@ -1263,7 +1263,7 @@ where
             YaccKind::Original(YaccOriginalActionKind::NoAction) => {
                 quote! {
                     ::lrpar::RTParserBuilder::new(grm, stable)
-                        .recoverer(#recoverer)
+                        .recoverer(recovery_kind)
                         .parse_map(lexer, &|_| (), &|_, _| ()).1
                 }
             }
@@ -1304,7 +1304,7 @@ where
                             ) -> #actionskind #type_generics
                         > = ::std::vec![#(&#wrappers,)*];
                     match ::lrpar::RTParserBuilder::new(grm, stable)
-                        .recoverer(#recoverer)
+                        .recoverer(recovery_kind)
                         .parse_actions(lexer, &actions, #action_fn_parse_param) {
                             (Some(#actionskind::#action_ident(x)), y) => (Some(x), y),
                             (None, y) => (None, y),
@@ -1324,17 +1324,17 @@ where
         let (generics, _, where_clause) = parsed_parse_generics.split_for_impl();
 
         // `parse()` may or may not have an argument for `%parseparam`.
-        let parse_fn_parse_param = match self.yacckind.unwrap() {
+        let (parse_fn_parse_param, parse_fn_parse_arg) = match self.yacckind.unwrap() {
             YaccKind::Original(YaccOriginalActionKind::UserAction) | YaccKind::Grmtools => {
                 if let Some((name, tyname)) = grm.parse_param() {
                     let name = str::parse::<TokenStream>(name)?;
                     let tyname = str::parse::<TokenStream>(tyname)?;
-                    Some(quote! {#name: #tyname})
+                    (Some(quote! {#name: #tyname}), Some(name))
                 } else {
-                    None
+                    (None, None)
                 }
             }
-            _ => None,
+            _ => (None, None),
         };
         let parse_fn_return_ty = match self.yacckind.unwrap() {
             YaccKind::Original(YaccOriginalActionKind::UserAction) | YaccKind::Grmtools => {
@@ -1406,6 +1406,21 @@ where
             #[allow(dead_code)]
             pub fn parse #generics (
                  lexer: &'lexer dyn ::lrpar::NonStreamingLexer<'input, #lexertypest>,
+                 #parse_fn_parse_param
+            ) -> #parse_fn_return_ty
+            #where_clause
+            {
+                parse_with_recovery_kind(
+                    lexer,
+                    #recoverer,
+                    #parse_fn_parse_arg
+                )
+            }
+
+            #[allow(dead_code)]
+            pub fn parse_with_recovery_kind #generics (
+                 lexer: &'lexer dyn ::lrpar::NonStreamingLexer<'input, #lexertypest>,
+                 recovery_kind: ::lrpar::RecoveryKind,
                  #parse_fn_parse_param
             ) -> #parse_fn_return_ty
             #where_clause
@@ -2112,6 +2127,7 @@ A : 'a';"
                 (None,                None,               Some(RK::CPCTPlus)),
                 (Some(RK::None),      None,               Some(RK::None)),
                 (Some(RK::CPCTPlus),  None,               Some(RK::CPCTPlus)),
+                (None, Some(RK::CPCTPlusDelimiterDominance), Some(RK::CPCTPlusDelimiterDominance)),
             ];
 
         for (i, (builder_arg, header_arg, expected_rk)) in
@@ -2127,6 +2143,9 @@ A : 'a';"
                     match header_arg {
                         RK::None => "RecoveryKind::None",
                         RK::CPCTPlus => "RecoveryKind::CPCTPlus",
+                        RK::CPCTPlusDelimiterDominance => {
+                            "RecoveryKind::CPCTPlusDelimiterDominance"
+                        }
                     }
                 )
             } else {
@@ -2154,7 +2173,12 @@ A : 'a';"
             .inspect_recoverer(Box::new(move |rk| {
                 if matches!(
                     (rk, expected_rk),
-                    (RK::None, Some(RK::None)) | (RK::CPCTPlus, Some(RK::CPCTPlus))
+                    (RK::None, Some(RK::None))
+                        | (RK::CPCTPlus, Some(RK::CPCTPlus))
+                        | (
+                            RK::CPCTPlusDelimiterDominance,
+                            Some(RK::CPCTPlusDelimiterDominance)
+                        )
                 ) {
                     Ok(())
                 } else {

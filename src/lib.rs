@@ -1,5 +1,7 @@
 use lrlex::lrlex_mod;
-use lrpar::{LexError, LexParseError, Lexeme, NonStreamingLexer, RecoveryStats, lrpar_mod};
+use lrpar::{
+    LexError, LexParseError, Lexeme, NonStreamingLexer, RecoveryKind, RecoveryStats, lrpar_mod,
+};
 
 pub mod delimiter;
 pub mod localization;
@@ -31,7 +33,7 @@ pub struct ObservedBaselineReport {
 }
 
 pub fn parse_baseline(input: &str) -> BaselineReport {
-    parse_baseline_internal(input, false).0
+    parse_baseline_internal(input, false, RecoveryOptions::default()).0
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,21 +43,43 @@ pub struct BaselineRecoveryStatsReport {
     pub recovery_stats: Vec<RecoveryStats>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RecoveryOptions {
+    /// Enable experimental strict-cost delimiter-aware dominance. Default is disabled.
+    pub delimiter_dominance: bool,
+}
+
 pub fn parse_baseline_with_recovery_stats(input: &str) -> BaselineRecoveryStatsReport {
-    let (baseline, recovery_stats) = parse_baseline_internal(input, true);
+    parse_baseline_with_recovery_stats_and_options(input, RecoveryOptions::default())
+}
+
+pub fn parse_baseline_with_recovery_stats_and_options(
+    input: &str,
+    options: RecoveryOptions,
+) -> BaselineRecoveryStatsReport {
+    let (baseline, recovery_stats) = parse_baseline_internal(input, true, options);
     BaselineRecoveryStatsReport {
         baseline,
         recovery_stats,
     }
 }
 
+pub fn parse_baseline_with_options(input: &str, options: RecoveryOptions) -> BaselineReport {
+    parse_baseline_internal(input, false, options).0
+}
+
 fn parse_baseline_internal(
     input: &str,
     collect_recovery_stats: bool,
+    options: RecoveryOptions,
 ) -> (BaselineReport, Vec<RecoveryStats>) {
     let lexerdef = expr_l::lexerdef();
     let lexer = lexerdef.lexer(input);
-    let (res, errs) = expr_y::parse(&lexer);
+    let (res, errs) = if options.delimiter_dominance {
+        expr_y::parse_with_recovery_kind(&lexer, RecoveryKind::CPCTPlusDelimiterDominance)
+    } else {
+        expr_y::parse(&lexer)
+    };
     let recovery_stats = if collect_recovery_stats {
         errs.iter()
             .filter_map(|error| match error {
@@ -133,8 +157,9 @@ fn parser_error_position(
 #[cfg(test)]
 mod tests {
     use super::{
-        BaselineStatus, parse_baseline, parse_baseline_with_delimiter_observation,
-        parse_baseline_with_recovery_stats,
+        BaselineStatus, RecoveryOptions, parse_baseline, parse_baseline_with_delimiter_observation,
+        parse_baseline_with_options, parse_baseline_with_recovery_stats,
+        parse_baseline_with_recovery_stats_and_options,
     };
 
     #[test]
@@ -242,9 +267,11 @@ mod tests {
                 stats.configurations_discarded_cost
                     + stats.configurations_discarded_timeout
                     + stats.configurations_discarded_higher_cost
-                    + stats.configurations_discarded_duplicate,
+                    + stats.configurations_discarded_duplicate
+                    + stats.configurations_discarded_dominance,
                 "{input}: {stats:#?}"
             );
+            assert!(!stats.delimiter_dominance_enabled);
             assert_eq!(
                 stats.repair_sequences_after_simplification,
                 Some(repair_count),
@@ -255,6 +282,81 @@ mod tests {
                 Some(expected_cost),
                 "{input}: {stats:#?}"
             );
+        }
+    }
+
+    #[test]
+    fn strict_cost_dominance_option_preserves_baseline_repairs_and_costs() {
+        for input in ["1+*", "(1+2", "1+2)"] {
+            let baseline =
+                parse_baseline_with_recovery_stats_and_options(input, RecoveryOptions::default());
+            let dominant = parse_baseline_with_recovery_stats_and_options(
+                input,
+                RecoveryOptions {
+                    delimiter_dominance: true,
+                },
+            );
+            assert_eq!(
+                dominant.baseline.errors, baseline.baseline.errors,
+                "{input}"
+            );
+            assert_eq!(
+                dominant.baseline.status, baseline.baseline.status,
+                "{input}"
+            );
+            assert_eq!(dominant.recovery_stats.len(), 1, "{input}");
+            let stats = &dominant.recovery_stats[0];
+            let baseline_stats = &baseline.recovery_stats[0];
+            assert!(stats.delimiter_dominance_enabled, "{input}: {stats:#?}");
+            assert_eq!(
+                stats.minimum_recovery_cost, baseline_stats.minimum_recovery_cost,
+                "{input}"
+            );
+            assert_eq!(
+                stats.configurations_discarded,
+                stats.configurations_discarded_cost
+                    + stats.configurations_discarded_timeout
+                    + stats.configurations_discarded_higher_cost
+                    + stats.configurations_discarded_duplicate
+                    + stats.configurations_discarded_dominance,
+                "{input}: {stats:#?}"
+            );
+        }
+
+        let unexpected_closer = parse_baseline_with_options(
+            "1+2)",
+            RecoveryOptions {
+                delimiter_dominance: true,
+            },
+        );
+        assert_eq!(
+            unexpected_closer.errors,
+            ["Parsing error at line 1 column 4. Repair sequences found:\n   1: Delete )"]
+        );
+    }
+
+    #[test]
+    fn default_recovery_options_keep_dominance_disabled() {
+        let report = parse_baseline_with_recovery_stats("1+*");
+        assert!(
+            report
+                .recovery_stats
+                .iter()
+                .all(|stats| !stats.delimiter_dominance_enabled)
+        );
+    }
+
+    #[test]
+    fn enabling_dominance_does_not_change_valid_parse_results() {
+        for input in ["1+2", "(1+2)*3", "((1+2)*3)"] {
+            let baseline = parse_baseline(input);
+            let experimental = parse_baseline_with_options(
+                input,
+                RecoveryOptions {
+                    delimiter_dominance: true,
+                },
+            );
+            assert_eq!(experimental, baseline, "{input}");
         }
     }
 

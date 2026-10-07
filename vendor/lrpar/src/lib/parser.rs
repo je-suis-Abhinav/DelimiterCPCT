@@ -94,7 +94,7 @@ type ActionFn<'a, 'b, 'input, StorageT, LexerTypesT, ActionT, ParamT> = &'a dyn 
     ParamT,
 ) -> ActionT;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub(super) enum DelimiterKind {
     Parenthesis,
     Brace,
@@ -128,13 +128,13 @@ pub(super) enum DelimiterCloseContext {
     Unexpected,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub(super) enum DelimiterOriginKind {
     Real,
     Inserted { ordinal: u64 },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub(super) struct DelimiterOrigin {
     pub(super) input_index: usize,
     pub(super) char_index: usize,
@@ -142,7 +142,7 @@ pub(super) struct DelimiterOrigin {
     pub(super) kind: DelimiterOriginKind,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub(super) struct DelimiterFrame {
     pub(super) kind: DelimiterKind,
     pub(super) input_index: usize,
@@ -152,7 +152,7 @@ pub(super) struct DelimiterFrame {
     pub(super) origin_kind: DelimiterOriginKind,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
 pub(super) struct DelimiterState {
     pub(super) stack: Vec<DelimiterFrame>,
     pub(super) matched_delimiters: u64,
@@ -767,7 +767,10 @@ where
                 Action::Error => {
                     if recoverer.is_none() {
                         recoverer = Some(match self.rcvry_kind {
-                            RecoveryKind::CPCTPlus => cpctplus::recoverer(self),
+                            RecoveryKind::CPCTPlus => cpctplus::recoverer(self, false),
+                            RecoveryKind::CPCTPlusDelimiterDominance => {
+                                cpctplus::recoverer(self, true)
+                            }
                             RecoveryKind::None => {
                                 let la_lexeme = self.next_lexeme(laidx);
                                 errors.push(
@@ -1059,8 +1062,8 @@ pub(super) trait Recoverer<
 
 /// Search statistics collected during one CPCT+ recovery attempt.
 ///
-/// These counters observe the existing search; they do not affect candidate generation,
-/// configuration merging, repair costs, or repair selection.
+/// Counters observe each recovery search. Strict-cost delimiter dominance changes search only
+/// when explicitly enabled through [`RecoveryKind::CPCTPlusDelimiterDominance`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RecoveryStats {
     /// Neighbor candidates offered to the frontier, including ones later merged or rejected.
@@ -1069,7 +1072,7 @@ pub struct RecoveryStats {
     pub configurations_popped: u64,
     /// Frontier key collisions for which the merge callback was invoked, including duplicates.
     pub configurations_merged: u64,
-    /// Candidate configurations or queued entries not explored, summed across reason counters.
+    /// Discard events summed across reason counters; a reason may count frontier nodes or variants.
     pub configurations_discarded: u64,
     /// Same-cost-closure neighbors rejected because they exceed the minimum repair cost.
     pub configurations_discarded_cost: u64,
@@ -1079,6 +1082,19 @@ pub struct RecoveryStats {
     pub configurations_discarded_higher_cost: u64,
     /// Duplicate repair histories ignored during a merge; these are also counted as merged.
     pub configurations_discarded_duplicate: u64,
+    /// Repair variants discarded because an exact delimiter-aware state was already reached
+    /// with strictly lower CPCT+ cost.
+    pub configurations_discarded_dominance: u64,
+    /// Number of repair variants considered by the strict-cost dominance index.
+    pub dominance_candidates_checked: u64,
+    /// Candidates whose complete dominance key was already present, including equal-cost cases.
+    pub dominance_exact_key_matches: u64,
+    /// Number of repair-history variants removed by strict-cost dominance.
+    pub dominance_variants_discarded: u64,
+    /// Sum of (discarded cost - dominating cost) over discarded variants.
+    pub dominance_discarded_cost_difference: u64,
+    /// Whether strict-cost delimiter-aware dominance was enabled for this recovery attempt.
+    pub delimiter_dominance_enabled: bool,
     /// Candidate insertion transitions attempted (one per non-EOF terminal considered).
     pub insert_transitions_attempted: u64,
     /// Delete transition calls, including calls at EOF where no transition can be emitted.
@@ -1113,6 +1129,9 @@ pub enum RecoveryKind {
     /// The CPCT+ algorithm from Diekmann/Tratt "Don't Panic! Better, Fewer, Syntax Errors for LR
     /// Parsers".
     CPCTPlus,
+    /// Experimental CPCT+ with strict-cost dominance over identical parser, continuation, and
+    /// complete delimiter states. Equal-cost histories are retained.
+    CPCTPlusDelimiterDominance,
     /// Don't use error recovery: return as soon as the first syntax error is encountered.
     None,
 }
@@ -1129,6 +1148,10 @@ impl TryFrom<RecoveryKind> for Value<Location> {
             RecoveryKind::CPCTPlus => Value::Setting(Setting::Unitary(Namespaced {
                 namespace: Some(("RecoveryKind".to_string(), from_loc.clone())),
                 member: ("CPCTPlus".to_string(), from_loc.clone()),
+            })),
+            RecoveryKind::CPCTPlusDelimiterDominance => Value::Setting(Setting::Unitary(Namespaced {
+                namespace: Some(("RecoveryKind".to_string(), from_loc.clone())),
+                member: ("CPCTPlusDelimiterDominance".to_string(), from_loc.clone()),
             })),
             RecoveryKind::None => Value::Setting(Setting::Unitary(Namespaced {
                 namespace: Some(("RecoveryKind".to_string(), from_loc.clone())),
@@ -1162,6 +1185,9 @@ impl TryFrom<&Value<Location>> for RecoveryKind {
                 }
                 match kind.to_lowercase().as_ref() {
                     "cpctplus" => Ok(RecoveryKind::CPCTPlus),
+                    "cpctplusdelimiterdominance" => {
+                        Ok(RecoveryKind::CPCTPlusDelimiterDominance)
+                    }
                     "none" => Ok(RecoveryKind::None),
                     _ => Err(HeaderError {
                         kind: HeaderErrorKind::ConversionError("RecoveryKind", "Unknown variant"),
@@ -1184,6 +1210,9 @@ impl quote::ToTokens for RecoveryKind {
     fn to_tokens(&self, tokens: &mut TokenStream) {
         tokens.extend(match *self {
             RecoveryKind::CPCTPlus => quote!(::lrpar::RecoveryKind::CPCTPlus),
+            RecoveryKind::CPCTPlusDelimiterDominance => {
+                quote!(::lrpar::RecoveryKind::CPCTPlusDelimiterDominance)
+            }
             RecoveryKind::None => quote!(::lrpar::RecoveryKind::None),
         })
     }

@@ -6,9 +6,9 @@ Recovery".
 
 The baseline uses the original `lrpar` 0.15.0 CPCT+ algorithm to parse integer
 expressions with addition, multiplication, and parentheses. The local `lrpar`
-source copy adds read-only search instrumentation and per-configuration
-delimiter/history metadata; neither influences CPCT+ decisions or repair
-results.
+source copy adds search instrumentation and per-configuration delimiter/history
+metadata. The default parser remains baseline CPCT+; an explicit experimental
+option enables strict-cost delimiter-aware dominance.
 
 - integer literals
 - `+`
@@ -49,6 +49,7 @@ cargo run -- "1+2*3"
 cargo run -- "1+*"
 cargo run -- --observe-delimiters "((1+2)*3"
 cargo run -- --recovery-stats "1+*"
+cargo run -- --delimiter-dominance --recovery-stats "1+*"
 ```
 
 The program prints whether parsing succeeded, recovered through baseline CPCT+,
@@ -58,10 +59,11 @@ the reported parser errors and repair sequences exposed by `lrpar`.
 With `--observe-delimiters`, the program still runs the same baseline parser and
 also prints the independent delimiter observation report.
 
-With `--recovery-stats`, the same CPCT+ implementation reports per-recovery
-search counters, repair-sequence counts, minimum recovery cost, timeout status,
-and elapsed time. This mode only observes the search; it does not change
-candidate generation, merging, costs, continuation ranking, or repair selection.
+With `--recovery-stats`, the selected CPCT+ mode reports per-recovery search
+counters, repair-sequence counts, minimum recovery cost, timeout status, and
+elapsed time. By default, this mode only observes the search. The optional
+`--delimiter-dominance` flag enables the experimental rule documented below.
+The Rust API exposes the same OFF-by-default control with `RecoveryOptions`.
 
 ## Delimiter Observation
 
@@ -118,6 +120,8 @@ There are now two execution paths:
 - baseline CPCT+: `parse_baseline`
 - baseline CPCT+ plus delimiter observation:
   `parse_baseline_with_delimiter_observation`
+- opt-in strict-cost dominance:
+  `parse_baseline_with_options` with `RecoveryOptions`
 
 The second path only adds structural observation. It does not modify repair
 costs, prune configurations, rank repairs differently, add delimiter-specific
@@ -129,8 +133,9 @@ that history, including opening kind, token/input index, character index, byte
 offset, nesting depth, and whether the opening was real or inserted. Compatible
 CPCT+ configurations still use the existing frontier grouping and
 continuation-control compatibility; metadata is kept paired when their repair
-histories are merged. This representation adds per-history storage and does
-not prune, reorder, change costs, or alter repair selection.
+histories are merged. With dominance disabled, this representation does not
+prune, reorder, change costs, or alter repair selection. The opt-in strict-cost
+mode is described separately below.
 
 ## Testing
 
@@ -172,10 +177,13 @@ counts neighbor candidates offered to the frontier (not the initial node);
 “popped” counts unique frontier entries removed and checked for success.
 “Merged” counts frontier key collisions (including exact duplicate histories).
 Discard counters distinguish same-cost-closure cost rejects, deadline leftovers,
-higher-cost nodes after minimum-cost discovery, and identical histories ignored
-during merging. Duplicate-history events are therefore included in both the
-merged counter and the discarded-reason total; the discard total itself is the
-sum of disjoint discard reasons.
+higher-cost nodes after minimum-cost discovery, identical histories ignored
+during merging, and strict-cost dominance removals. Duplicate-history events
+are therefore included in both the
+merged counter and the discarded-reason total. The aggregate discard counter
+is a sum of discard events, not a count of unique frontier nodes: dominance and
+duplicate reasons count repair variants/histories, while other reasons count
+candidate or queued configurations.
 Transition-attempt counters count each non-EOF insertion terminal considered,
 each delete transition call (including calls at EOF), and each shift/reduction
 transition call. Repair-sequence counts are measured after collection, after
@@ -207,9 +215,48 @@ histogram over popped configurations; `minimum_cost_success_delimiter_scores`
 records the scores of successful configurations at the minimum CPCT+ cost; and
 `selected_repair_delimiter_score` scores the repair selected by the existing
 continuation filtering and simplification. Scores do not participate in
-frontier ordering, pruning, merging, continuation filtering, or repair
+frontier ordering, dominance, merging, continuation filtering, or repair
 selection. They use only the grammar-neutral delimiter stack and current
 lookahead, not grammar productions or the project-level checkpoint scanner.
+
+## Experimental Strict-Cost Delimiter Dominance
+
+Dominance is OFF for existing parser entry points. Enable it explicitly with
+`--delimiter-dominance` (optionally combined with `--recovery-stats`) or with
+`RecoveryOptions { delimiter_dominance: true }`. The generated parser also
+exposes `parse_with_recovery_kind`, and vendored lrpar provides
+`RecoveryKind::CPCTPlusDelimiterDominance`.
+
+Variant A is discarded only when a previous variant has a **strictly lower
+accumulated CPCT+ cost** and an exactly equal dominance key. The key is:
+
+- the complete LR parser state stack;
+- the current input/lexeme index;
+- the CPCT+ continuation state: delete-ending status and trailing-shift count;
+- the complete delimiter state, including delimiter kinds, opening origins,
+  real-versus-inserted identity, depth, and delimiter event counters.
+
+Equal-cost variants are retained, including distinct repair histories. Different
+delimiter stacks or opening origins, parser stacks, input positions, or
+continuation states do not match. The index only filters variants; it does not
+alter transition costs, cost-bucket ordering, continuation ranking, repair
+simplification, or repair selection. The delimiter score is never consulted.
+
+The correctness rationale is that equal keys have identical future LR behavior,
+the same legal CPCT+ continuation controls, and identical deterministic
+delimiter-state updates. Therefore every continuation available to a
+higher-cost variant is also available to the lower-cost variant at the same
+incremental cost. A strictly more expensive variant cannot contribute a
+minimum-cost repair; an equal-cost history can, and is never removed. Tests
+compare minimum costs and complete reported minimum-cost repair sets with
+dominance OFF and ON.
+
+`RecoveryStats` adds `dominance_candidates_checked`,
+`dominance_exact_key_matches`, `dominance_variants_discarded`, and
+`dominance_discarded_cost_difference`; `configurations_discarded_dominance`
+feeds the aggregate discarded count. Equal-cost key matches are counted but
+not discarded. No performance improvement is claimed unless measured runs
+show reduced generated or popped work.
 
 ## API Limitations Noted
 

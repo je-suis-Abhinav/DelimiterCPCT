@@ -90,6 +90,66 @@ struct PathFNode<StorageT> {
     variants: Vec<RepairVariant<StorageT>>,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct DominanceKey<StorageT: Hash> {
+    pstack: Cactus<StIdx<StorageT>>,
+    laidx: usize,
+    ends_with_delete: bool,
+    trailing_shifts: usize,
+    delimiter_state: DelimiterState,
+}
+
+fn dominance_key<StorageT: Hash + PrimInt + Unsigned>(
+    pstack: &Cactus<StIdx<StorageT>>,
+    laidx: usize,
+    variant: &RepairVariant<StorageT>,
+) -> DominanceKey<StorageT> {
+    DominanceKey {
+        pstack: pstack.clone(),
+        laidx,
+        ends_with_delete: variant.last_repair() == Some(Repair::Delete),
+        trailing_shifts: variant.trailing_shifts(),
+        delimiter_state: variant.delimiter_state.clone(),
+    }
+}
+
+fn retain_nondominated_variants<StorageT: Hash + PrimInt + Unsigned>(
+    node: &mut PathFNode<StorageT>,
+    cost: u16,
+    best_costs: &mut HashMap<DominanceKey<StorageT>, u16>,
+    stats: &mut RecoveryStats,
+) -> bool {
+    let pstack = node.pstack.clone();
+    let laidx = node.laidx;
+    node.variants.retain(|variant| {
+        stats.dominance_candidates_checked += 1;
+        let key = dominance_key(&pstack, laidx, variant);
+        match best_costs.get_mut(&key) {
+            None => {
+                best_costs.insert(key, cost);
+                true
+            }
+            Some(best_cost) => {
+                stats.dominance_exact_key_matches += 1;
+                if *best_cost < cost {
+                    stats.configurations_discarded_dominance += 1;
+                    stats.dominance_variants_discarded += 1;
+                    stats.dominance_discarded_cost_difference +=
+                        u64::from(cost - *best_cost);
+                    stats.configurations_discarded += 1;
+                    false
+                } else {
+                    if cost < *best_cost {
+                        *best_cost = cost;
+                    }
+                    true
+                }
+            }
+        }
+    });
+    !node.variants.is_empty()
+}
+
 struct RepairCandidate<LexemeT, StorageT>
 where
     LexemeT: Lexeme<StorageT>,
@@ -163,6 +223,7 @@ struct CPCTPlus<
     usize: AsPrimitive<StorageT>,
 {
     parser: &'a Parser<'a, 'b, 'input, StorageT, LexerTypesT, ActionT, ParamT>,
+    delimiter_dominance: bool,
 }
 
 pub(super) fn recoverer<
@@ -173,11 +234,15 @@ pub(super) fn recoverer<
     ParamT: Clone,
 >(
     parser: &'a Parser<StorageT, LexerTypesT, ActionT, ParamT>,
+    delimiter_dominance: bool,
 ) -> Box<dyn Recoverer<StorageT, LexerTypesT, ActionT, ParamT> + 'a>
 where
     usize: AsPrimitive<StorageT>,
 {
-    Box::new(CPCTPlus { parser })
+    Box::new(CPCTPlus {
+        parser,
+        delimiter_dominance,
+    })
 }
 
 impl<
@@ -210,6 +275,7 @@ where
     ) {
         let started = Instant::now();
         let mut stats = RecoveryStats::default();
+        stats.delimiter_dominance_enabled = self.delimiter_dominance;
         let error_delimiter = parser.delimiter_for_lexeme(&parser.next_lexeme(in_laidx));
         let delimiter_score_context = DelimiterScoreContext::new(delimiter_state, error_delimiter);
         // This function implements a minor variant of the algorithm from "Repairing syntax errors
@@ -242,6 +308,7 @@ where
                 delimiter_state: delimiter_state.clone(),
             }],
         };
+        let mut dominance_index = HashMap::new();
         let astar_cnds = dijkstra(
             start_node,
             |explore_all, n, nbrs, stats| {
@@ -304,6 +371,13 @@ where
                     .map(|variant| delimiter_score_context.score(&variant.delimiter_state))
                     .max()
                     .unwrap_or_default()
+            },
+            |n, cost, stats| {
+                if self.delimiter_dominance {
+                    retain_nondominated_variants(n, cost, &mut dominance_index, stats)
+                } else {
+                    true
+                }
             },
             &mut stats,
         );
@@ -895,6 +969,8 @@ fn ends_with_parse_at_least_shifts<StorageT: PrimInt + Unsigned>(
 
 #[cfg(test)]
 mod test {
+    use std::collections::HashMap;
+
     use cactus::Cactus;
     use cfgrammar::yacc::YaccGrammar;
     use num_traits::ToPrimitive;
@@ -902,13 +978,16 @@ mod test {
     use crate::{
         LexParseError, Lexeme, NonStreamingLexer,
         parser::{
-            DelimiterKind, DelimiterOrigin, DelimiterOriginKind, DelimiterState,
-            ParseRepair, RecoveryKind,
+            DelimiterKind, DelimiterOrigin, DelimiterOriginKind, DelimiterScoreContext,
+            DelimiterState, ParseRepair, RecoveryKind, RecoveryStats,
             test::{SmallLexer, do_parse},
         },
         test_utils::{TestLexeme, TestLexerTypes},
     };
-    use super::{PathFNode, Repair, RepairMerge, RepairVariant, merge_variants};
+    use super::{
+        PathFNode, Repair, RepairMerge, RepairVariant, merge_variants,
+        retain_nondominated_variants,
+    };
 
     fn delimiter_state(kind: char, input_index: usize, byte_index: usize) -> DelimiterState {
         let mut state = DelimiterState::default();
@@ -934,6 +1013,185 @@ mod test {
                 .child(RepairMerge::Repair(repair)),
             delimiter_state,
         }
+    }
+
+    fn dominance_node(
+        variant: RepairVariant<u16>,
+        cost: u16,
+    ) -> PathFNode<u16> {
+        PathFNode {
+            pstack: Cactus::new().child(lrtable::StIdx(0u16)),
+            laidx: 3,
+            cf: cost,
+            variants: vec![variant],
+        }
+    }
+
+    #[test]
+    fn strict_cost_dominance_preserves_equal_cost_histories() {
+        let state = DelimiterState::default();
+        let first = repair_variant(Repair::InsertTerm(cfgrammar::TIdx(1)), state.clone());
+        let second = repair_variant(Repair::InsertTerm(cfgrammar::TIdx(2)), state);
+        let mut index = HashMap::new();
+        let mut stats = RecoveryStats::default();
+        let mut first_node = dominance_node(first, 2);
+        let mut second_node = dominance_node(second, 2);
+
+        assert!(retain_nondominated_variants(
+            &mut first_node,
+            2,
+            &mut index,
+            &mut stats
+        ));
+        assert!(retain_nondominated_variants(
+            &mut second_node,
+            2,
+            &mut index,
+            &mut stats
+        ));
+        assert_eq!(second_node.variants.len(), 1);
+        assert_eq!(stats.dominance_exact_key_matches, 1);
+        assert_eq!(stats.dominance_variants_discarded, 0);
+    }
+
+    #[test]
+    fn strict_cost_dominance_discards_only_an_exact_higher_cost_match() {
+        let state = DelimiterState::default();
+        let lower = repair_variant(Repair::InsertTerm(cfgrammar::TIdx(1)), state.clone());
+        let higher = repair_variant(Repair::InsertTerm(cfgrammar::TIdx(2)), state);
+        let mut index = HashMap::new();
+        let mut stats = RecoveryStats::default();
+        let mut lower_node = dominance_node(lower, 1);
+        let mut higher_node = dominance_node(higher, 4);
+
+        assert!(retain_nondominated_variants(
+            &mut lower_node,
+            1,
+            &mut index,
+            &mut stats
+        ));
+        assert!(!retain_nondominated_variants(
+            &mut higher_node,
+            4,
+            &mut index,
+            &mut stats
+        ));
+        assert!(higher_node.variants.is_empty());
+        assert_eq!(stats.dominance_exact_key_matches, 1);
+        assert_eq!(stats.dominance_variants_discarded, 1);
+        assert_eq!(stats.dominance_discarded_cost_difference, 3);
+        assert_eq!(stats.configurations_discarded_dominance, 1);
+    }
+
+    #[test]
+    fn delimiter_state_and_opening_origin_are_part_of_dominance_key() {
+        let first = repair_variant(
+            Repair::InsertTerm(cfgrammar::TIdx(1)),
+            delimiter_state('(', 1, 2),
+        );
+        let second = repair_variant(
+            Repair::InsertTerm(cfgrammar::TIdx(2)),
+            delimiter_state('(', 4, 12),
+        );
+        let mut index = HashMap::new();
+        let mut stats = RecoveryStats::default();
+        let mut first_node = dominance_node(first, 1);
+        let mut second_node = dominance_node(second, 9);
+
+        assert!(retain_nondominated_variants(
+            &mut first_node,
+            1,
+            &mut index,
+            &mut stats
+        ));
+        assert!(retain_nondominated_variants(
+            &mut second_node,
+            9,
+            &mut index,
+            &mut stats
+        ));
+        assert_eq!(second_node.variants.len(), 1);
+        assert_eq!(stats.dominance_exact_key_matches, 0);
+        assert_eq!(stats.dominance_variants_discarded, 0);
+    }
+
+    #[test]
+    fn parser_position_and_continuation_control_are_part_of_dominance_key() {
+        let state = DelimiterState::default();
+        let base = repair_variant(Repair::InsertTerm(cfgrammar::TIdx(1)), state.clone());
+        let base_node = dominance_node(base.clone(), 1);
+        let mut index = HashMap::new();
+        let mut stats = RecoveryStats::default();
+        let mut first = base_node.clone();
+        assert!(retain_nondominated_variants(
+            &mut first,
+            1,
+            &mut index,
+            &mut stats
+        ));
+
+        let mut different_input = dominance_node(base.clone(), 5);
+        different_input.laidx += 1;
+        let mut different_stack = dominance_node(base.clone(), 5);
+        different_stack.pstack = Cactus::new().child(lrtable::StIdx(1u16));
+        let mut delete_control = dominance_node(
+            repair_variant(Repair::Delete, state.clone()),
+            5,
+        );
+        let shifts = RepairVariant {
+            repairs: base
+                .repairs
+                .child(RepairMerge::Repair(Repair::Shift))
+                .child(RepairMerge::Repair(Repair::Shift)),
+            delimiter_state: state,
+        };
+        let mut shift_control = dominance_node(shifts, 5);
+
+        for candidate in [
+            &mut different_input,
+            &mut different_stack,
+            &mut delete_control,
+            &mut shift_control,
+        ] {
+            assert!(retain_nondominated_variants(
+                candidate,
+                5,
+                &mut index,
+                &mut stats
+            ));
+        }
+        assert_eq!(stats.dominance_exact_key_matches, 0);
+        assert_eq!(stats.dominance_variants_discarded, 0);
+    }
+
+    #[test]
+    fn delimiter_score_never_participates_in_dominance() {
+        let empty = DelimiterState::default();
+        let opened = delimiter_state('(', 1, 2);
+        let score_context = DelimiterScoreContext::new(&empty, None);
+        assert_ne!(score_context.score(&empty), score_context.score(&opened));
+
+        let lower_score = repair_variant(Repair::InsertTerm(cfgrammar::TIdx(1)), opened);
+        let higher_score = repair_variant(Repair::InsertTerm(cfgrammar::TIdx(2)), empty);
+        let mut index = HashMap::new();
+        let mut stats = RecoveryStats::default();
+        let mut lower_score_node = dominance_node(lower_score, 1);
+        let mut higher_score_node = dominance_node(higher_score, 5);
+
+        assert!(retain_nondominated_variants(
+            &mut lower_score_node,
+            1,
+            &mut index,
+            &mut stats
+        ));
+        assert!(retain_nondominated_variants(
+            &mut higher_score_node,
+            5,
+            &mut index,
+            &mut stats
+        ));
+        assert_eq!(higher_score_node.variants.len(), 1);
+        assert_eq!(stats.dominance_variants_discarded, 0);
     }
 
     #[test]
@@ -1289,5 +1547,76 @@ Unmatched:
             &errs[0],
             &[r#"Insert "BLAH", Delete "l", Delete "o", Delete "n", Delete "g""#],
         );
+    }
+
+    fn recovery_signature(
+        recovery_kind: RecoveryKind,
+        input: &str,
+    ) -> (Vec<Vec<String>>, Vec<Option<u16>>, Vec<RecoveryStats>) {
+        let lexs = r#"[0-9]+ 'INT'
+\+ '+'
+\* '*'
+\( '('
+\) ')'"#;
+        let grms = r#"%start E
+%%
+E: E '+' E
+ | E '*' E
+ | '(' E ')'
+ | 'INT'
+ ;"#;
+        let (grm, lex, parsed) = do_parse(recovery_kind, lexs, grms, input);
+        let (_, errors) = parsed.unwrap_err();
+        let mut repair_sets = Vec::new();
+        let mut costs = Vec::new();
+        let mut stats = Vec::new();
+        for error in errors {
+            let LexParseError::ParseError(error) = error else {
+                panic!("expected parser error for {input}");
+            };
+            let mut repairs = error
+                .repairs()
+                .iter()
+                .map(|repairs| pp_repairs(&grm, &lex, repairs))
+                .collect::<Vec<_>>();
+            repairs.sort();
+            repair_sets.push(repairs);
+            costs.push(
+                error
+                    .recovery_stats()
+                    .and_then(|recovery| recovery.minimum_recovery_cost),
+            );
+            if let Some(recovery) = error.recovery_stats() {
+                stats.push(recovery.clone());
+            }
+        }
+        (repair_sets, costs, stats)
+    }
+
+    #[test]
+    fn dominance_preserves_minimum_cost_repair_sets_and_unexpected_closer_repair() {
+        for input in ["1+*", "(1+2", "1+2)"] {
+            let baseline = recovery_signature(RecoveryKind::CPCTPlus, input);
+            let dominant = recovery_signature(RecoveryKind::CPCTPlusDelimiterDominance, input);
+            assert_eq!(dominant.0, baseline.0, "repair set changed for {input}");
+            assert_eq!(dominant.1, baseline.1, "minimum cost changed for {input}");
+            assert!(
+                dominant.2.iter().all(|stats| stats.delimiter_dominance_enabled),
+                "{input}: {:#?}",
+                dominant.2
+            );
+        }
+
+        let unexpected_closer =
+            recovery_signature(RecoveryKind::CPCTPlusDelimiterDominance, "1+2)");
+        assert_eq!(unexpected_closer.1, [Some(1)]);
+        assert_eq!(
+            unexpected_closer.0,
+            [vec![r#"Delete ")""#.to_owned()]]
+        );
+
+        let equal_cost_alternatives =
+            recovery_signature(RecoveryKind::CPCTPlusDelimiterDominance, "1+*");
+        assert_eq!(equal_cost_alternatives.0[0].len(), 2);
     }
 }

@@ -1,13 +1,14 @@
 use std::{env, io};
 
 use DelimiterCPCT::{
-    BaselineStatus, delimiter::DelimiterReport, parse_baseline,
-    parse_baseline_with_delimiter_observation, parse_baseline_with_recovery_stats,
+    BaselineStatus, RecoveryOptions, delimiter::DelimiterReport, parse_baseline_with_options,
+    parse_baseline_with_recovery_stats_and_options,
 };
 
 fn main() {
     let mut observe = false;
     let mut show_recovery_stats = false;
+    let mut delimiter_dominance = false;
     let input = env::args()
         .skip(1)
         .filter(|arg| match arg.as_str() {
@@ -17,6 +18,10 @@ fn main() {
             }
             "--recovery-stats" => {
                 show_recovery_stats = true;
+                false
+            }
+            "--delimiter-dominance" => {
+                delimiter_dominance = true;
                 false
             }
             _ => true,
@@ -34,24 +39,29 @@ fn main() {
     };
 
     if input.trim().is_empty() {
-        eprintln!("Usage: cargo run -- [--observe-delimiters] [--recovery-stats] \"1+2*3\"");
+        eprintln!(
+            "Usage: cargo run -- [--observe-delimiters] [--recovery-stats] [--delimiter-dominance] \"1+2*3\""
+        );
         return;
     }
 
+    let options = RecoveryOptions {
+        delimiter_dominance,
+    };
     if show_recovery_stats {
-        let report = parse_baseline_with_recovery_stats(&input);
-        print_baseline(&report.baseline);
+        let report = parse_baseline_with_recovery_stats_and_options(&input, options);
+        print_baseline(&report.baseline, delimiter_dominance);
         print_recovery_stats(&report.recovery_stats);
         if observe {
             print_delimiters(&DelimiterCPCT::delimiter::observe_delimiters(&input));
         }
     } else if observe {
-        let report = parse_baseline_with_delimiter_observation(&input);
-        print_baseline(&report.baseline);
-        print_delimiters(&report.delimiters);
+        let report = parse_baseline_with_options(&input, options);
+        print_baseline(&report, delimiter_dominance);
+        print_delimiters(&DelimiterCPCT::delimiter::observe_delimiters(&input));
     } else {
-        let report = parse_baseline(&input);
-        print_baseline(&report);
+        let report = parse_baseline_with_options(&input, options);
+        print_baseline(&report, delimiter_dominance);
     }
 }
 
@@ -64,7 +74,7 @@ fn print_recovery_stats(stats: &[lrpar::RecoveryStats]) {
     for (index, recovery) in stats.iter().enumerate() {
         println!("CPCT+ recovery statistics #{}:", index + 1);
         println!(
-            "  configurations: generated={}, popped={}, merged={}, discarded={} (cost={}, timeout={}, higher_cost={}, duplicate={})",
+            "  configurations: generated={}, popped={}, merged={}, discarded={} (cost={}, timeout={}, higher_cost={}, duplicate={}, dominance={})",
             recovery.configurations_generated,
             recovery.configurations_popped,
             recovery.configurations_merged,
@@ -72,7 +82,8 @@ fn print_recovery_stats(stats: &[lrpar::RecoveryStats]) {
             recovery.configurations_discarded_cost,
             recovery.configurations_discarded_timeout,
             recovery.configurations_discarded_higher_cost,
-            recovery.configurations_discarded_duplicate
+            recovery.configurations_discarded_duplicate,
+            recovery.configurations_discarded_dominance
         );
         println!(
             "  transition attempts: insert={}, delete={}, shift/reduction={}",
@@ -98,11 +109,23 @@ fn print_recovery_stats(stats: &[lrpar::RecoveryStats]) {
             recovery.minimum_cost_success_delimiter_scores,
             recovery.selected_repair_delimiter_score
         );
+        println!(
+            "  strict-cost delimiter dominance: enabled={}, checked={}, exact_key_matches={}, variants_discarded={}, discarded_cost_difference={}",
+            recovery.delimiter_dominance_enabled,
+            recovery.dominance_candidates_checked,
+            recovery.dominance_exact_key_matches,
+            recovery.dominance_variants_discarded,
+            recovery.dominance_discarded_cost_difference
+        );
     }
 }
 
-fn print_baseline(report: &DelimiterCPCT::BaselineReport) {
-    println!("Baseline: unmodified lrpar CPCT+");
+fn print_baseline(report: &DelimiterCPCT::BaselineReport, delimiter_dominance: bool) {
+    if delimiter_dominance {
+        println!("Parser mode: experimental strict-cost delimiter-dominance CPCT+");
+    } else {
+        println!("Baseline: unmodified lrpar CPCT+");
+    }
     println!("Input: {}", report.input);
     match &report.status {
         BaselineStatus::Accepted => println!("Status: successful parse"),
