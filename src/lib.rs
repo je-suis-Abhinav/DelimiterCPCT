@@ -197,8 +197,37 @@ mod tests {
             assert_eq!(instrumented.recovery_stats.len(), 1, "{input}");
 
             let stats = &instrumented.recovery_stats[0];
+            let repeated = parse_baseline_with_recovery_stats(input);
+            let repeated_stats = &repeated.recovery_stats[0];
             assert!(stats.configurations_generated > 0, "{input}: {stats:#?}");
             assert!(stats.configurations_popped > 0, "{input}: {stats:#?}");
+            assert_eq!(
+                stats.delimiter_score_distribution.values().sum::<u64>(),
+                stats.configurations_popped,
+                "{input}: {stats:#?}"
+            );
+            assert!(
+                !stats.minimum_cost_success_delimiter_scores.is_empty(),
+                "{input}: {stats:#?}"
+            );
+            assert!(
+                stats.selected_repair_delimiter_score.is_some(),
+                "{input}: {stats:#?}"
+            );
+            assert_eq!(
+                stats.delimiter_score_distribution, repeated_stats.delimiter_score_distribution,
+                "{input}"
+            );
+            assert_eq!(
+                stats.minimum_cost_success_delimiter_scores,
+                repeated_stats.minimum_cost_success_delimiter_scores,
+                "{input}"
+            );
+            assert_eq!(
+                stats.selected_repair_delimiter_score,
+                repeated_stats.selected_repair_delimiter_score,
+                "{input}"
+            );
             assert!(
                 stats.insert_transitions_attempted > 0,
                 "{input}: {stats:#?}"

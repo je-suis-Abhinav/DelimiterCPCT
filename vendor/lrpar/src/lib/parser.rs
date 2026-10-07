@@ -1,5 +1,6 @@
 #![allow(clippy::derive_partial_eq_without_eq)]
 use std::{
+    collections::BTreeMap,
     error::Error,
     fmt::{self, Debug, Display, Write as _},
     hash::Hash,
@@ -92,6 +93,287 @@ type ActionFn<'a, 'b, 'input, StorageT, LexerTypesT, ActionT, ParamT> = &'a dyn 
     vec::Drain<AStackType<<LexerTypesT as LexerTypes>::LexemeT, ActionT>>,
     ParamT,
 ) -> ActionT;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum DelimiterKind {
+    Parenthesis,
+    Brace,
+    Bracket,
+}
+
+impl DelimiterKind {
+    fn from_open(delimiter: char) -> Option<Self> {
+        match delimiter {
+            '(' => Some(Self::Parenthesis),
+            '{' => Some(Self::Brace),
+            '[' => Some(Self::Bracket),
+            _ => None,
+        }
+    }
+
+    fn from_close(delimiter: char) -> Option<Self> {
+        match delimiter {
+            ')' => Some(Self::Parenthesis),
+            '}' => Some(Self::Brace),
+            ']' => Some(Self::Bracket),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum DelimiterCloseContext {
+    MatchingOpening,
+    MismatchedOpening,
+    Unexpected,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct DelimiterState {
+    stack: Vec<DelimiterKind>,
+    matched_delimiters: u64,
+    unexpected_closings: u64,
+    mismatched_closings: u64,
+    max_depth: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct DelimiterScoreContext {
+    initial_stack: Vec<DelimiterKind>,
+    initial_matched_delimiters: u64,
+    initial_unexpected_closings: u64,
+    initial_mismatched_closings: u64,
+    error_closing: Option<(DelimiterKind, DelimiterCloseContext)>,
+}
+
+impl DelimiterScoreContext {
+    pub(super) fn new(state: &DelimiterState, error_delimiter: Option<char>) -> Self {
+        let error_closing = error_delimiter.and_then(|delimiter| {
+            let closing = DelimiterKind::from_close(delimiter)?;
+            let context = match state.stack.last() {
+                Some(opening) if *opening == closing => DelimiterCloseContext::MatchingOpening,
+                Some(_) => DelimiterCloseContext::MismatchedOpening,
+                None => DelimiterCloseContext::Unexpected,
+            };
+            Some((closing, context))
+        });
+
+        Self {
+            initial_stack: state.stack.clone(),
+            initial_matched_delimiters: state.matched_delimiters,
+            initial_unexpected_closings: state.unexpected_closings,
+            initial_mismatched_closings: state.mismatched_closings,
+            error_closing,
+        }
+    }
+
+    /// Higher scores indicate more structural progress relative to the parser-error context:
+    /// +3 per original opening removed, -3 per new unmatched opening, +2 per new match,
+    /// -4 per new unexpected/mismatched close, and +2 when the error's closing delimiter
+    /// currently has a matching opening on top of the stack (bonus: +2, +3, or +4 for
+    /// matching, mismatched, or unexpected parser-error context, respectively).
+    pub(super) fn score(&self, state: &DelimiterState) -> i64 {
+        let shared_prefix = self
+            .initial_stack
+            .iter()
+            .zip(&state.stack)
+            .take_while(|(initial, current)| initial == current)
+            .count();
+        let resolved_openings = self.initial_stack.len().saturating_sub(shared_prefix);
+        let added_openings = state.stack.len().saturating_sub(shared_prefix);
+        let matches = state
+            .matched_delimiters
+            .saturating_sub(self.initial_matched_delimiters);
+        let unexpected = state
+            .unexpected_closings
+            .saturating_sub(self.initial_unexpected_closings);
+        let mismatched = state
+            .mismatched_closings
+            .saturating_sub(self.initial_mismatched_closings);
+
+        let to_score = |value: usize| i64::try_from(value).unwrap_or(i64::MAX);
+        let to_score_count = |value: u64| i64::try_from(value).unwrap_or(i64::MAX);
+        let mut score = to_score(resolved_openings)
+            .saturating_mul(3)
+            .saturating_sub(to_score(added_openings).saturating_mul(3))
+            .saturating_add(to_score_count(matches).saturating_mul(2))
+            .saturating_sub(to_score_count(unexpected).saturating_mul(4))
+            .saturating_sub(to_score_count(mismatched).saturating_mul(4));
+        if let Some((closing, context)) = self.error_closing
+            && state.stack.last() == Some(&closing)
+        {
+            let context_bonus = match context {
+                DelimiterCloseContext::MatchingOpening => 2,
+                DelimiterCloseContext::MismatchedOpening => 3,
+                DelimiterCloseContext::Unexpected => 4,
+            };
+            score = score.saturating_add(context_bonus);
+        }
+        score
+    }
+}
+
+impl DelimiterState {
+    pub(super) fn observe(&mut self, delimiter: char) {
+        if let Some(kind) = DelimiterKind::from_open(delimiter) {
+            self.stack.push(kind);
+            self.max_depth = self.max_depth.max(self.stack.len());
+        } else if let Some(kind) = DelimiterKind::from_close(delimiter) {
+            match self.stack.pop() {
+                Some(opening) if opening == kind => self.matched_delimiters += 1,
+                Some(_) => self.mismatched_closings += 1,
+                None => self.unexpected_closings += 1,
+            }
+        }
+    }
+
+    pub(super) fn observe_real_lexeme(&mut self, text: &str) {
+        if let Some(delimiter) = delimiter_char_from_text(text) {
+            self.observe(delimiter);
+        }
+    }
+}
+
+pub(super) fn delimiter_char_from_text(text: &str) -> Option<char> {
+    let mut chars = text.chars();
+    let delimiter = chars.next()?;
+    if chars.next().is_some()
+        || !matches!(delimiter, '(' | ')' | '{' | '}' | '[' | ']')
+    {
+        return None;
+    }
+    Some(delimiter)
+}
+
+pub(super) fn delimiter_char_from_terminal_name(name: &str) -> Option<char> {
+    delimiter_char_from_text(name).or_else(|| {
+        let quote = name.chars().next()?;
+        if !matches!(quote, '\'' | '"') || !name.ends_with(quote) {
+            return None;
+        }
+        delimiter_char_from_text(&name[quote.len_utf8()..name.len() - quote.len_utf8()])
+    })
+}
+
+#[cfg(test)]
+mod delimiter_state_tests {
+    use super::{
+        DelimiterKind, DelimiterScoreContext, DelimiterState,
+        delimiter_char_from_terminal_name,
+    };
+
+    #[test]
+    fn tracks_matched_delimiters_and_nested_depth() {
+        let mut state = DelimiterState::default();
+        for delimiter in ['(', '[', '{', '}', ']', ')'] {
+            state.observe(delimiter);
+        }
+
+        assert!(state.stack.is_empty());
+        assert_eq!(state.matched_delimiters, 3);
+        assert_eq!(state.max_depth, 3);
+        assert_eq!(state.unexpected_closings, 0);
+        assert_eq!(state.mismatched_closings, 0);
+    }
+
+    #[test]
+    fn tracks_unmatched_openings() {
+        let mut state = DelimiterState::default();
+        state.observe('(');
+        state.observe('[');
+
+        assert_eq!(state.stack, [DelimiterKind::Parenthesis, DelimiterKind::Bracket]);
+        assert_eq!(state.max_depth, 2);
+    }
+
+    #[test]
+    fn tracks_unexpected_and_mismatched_closings() {
+        let mut unexpected = DelimiterState::default();
+        unexpected.observe(')');
+        assert_eq!(unexpected.unexpected_closings, 1);
+        assert!(unexpected.stack.is_empty());
+
+        let mut mismatched = DelimiterState::default();
+        mismatched.observe('{');
+        mismatched.observe(')');
+        assert_eq!(mismatched.mismatched_closings, 1);
+        assert!(mismatched.stack.is_empty());
+    }
+
+    #[test]
+    fn real_shift_updates_delimiter_state_but_non_delimiters_do_not() {
+        let mut state = DelimiterState::default();
+        state.observe_real_lexeme("(");
+        let after_shift = state.clone();
+        state.observe_real_lexeme("identifier");
+        assert_eq!(state, after_shift);
+        assert_eq!(state.stack, [DelimiterKind::Parenthesis]);
+    }
+
+    #[test]
+    fn deleting_a_delimiter_leaves_the_configuration_state_unchanged() {
+        let mut before_delete = DelimiterState::default();
+        before_delete.observe('[');
+        let after_delete = before_delete.clone();
+
+        assert_eq!(after_delete, before_delete);
+        assert_eq!(after_delete.stack, [DelimiterKind::Bracket]);
+    }
+
+    #[test]
+    fn inserted_terminal_mapping_accepts_only_reliable_spellings() {
+        for (name, expected) in [
+            ("(", Some('(')),
+            ("')'", Some(')')),
+            ("\"[\"", Some('[')),
+            ("left_paren", None),
+            ("'not-a-delimiter'", None),
+            ("'(", None),
+        ] {
+            assert_eq!(delimiter_char_from_terminal_name(name), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn delimiter_scores_are_deterministic_and_reflect_error_context() {
+        let mut start = DelimiterState::default();
+        start.observe('(');
+        let context = DelimiterScoreContext::new(&start, Some(')'));
+
+        let mut resolved = start.clone();
+        resolved.observe(')');
+        let resolved_score = context.score(&resolved);
+        assert_eq!(context.score(&resolved), resolved_score);
+
+        let still_open = start.clone();
+        assert!(resolved_score > context.score(&still_open));
+
+        let unexpected_context = DelimiterScoreContext::new(&DelimiterState::default(), Some(']'));
+        let mut structurally_consistent = DelimiterState::default();
+        structurally_consistent.observe('[');
+        assert!(
+            unexpected_context.score(&structurally_consistent)
+                > unexpected_context.score(&DelimiterState::default())
+        );
+
+        let mut mismatched_start = DelimiterState::default();
+        mismatched_start.observe('{');
+        let mismatched_context = DelimiterScoreContext::new(&mismatched_start, Some(')'));
+        let mut resolved_mismatch = mismatched_start.clone();
+        resolved_mismatch.observe('}');
+        assert!(
+            mismatched_context.score(&resolved_mismatch)
+                > mismatched_context.score(&mismatched_start)
+        );
+
+        let mut new_unexpected_close = DelimiterState::default();
+        new_unexpected_close.observe(')');
+        assert!(
+            unexpected_context.score(&new_unexpected_close)
+                < unexpected_context.score(&DelimiterState::default())
+        );
+    }
+}
 
 #[derive(Debug)]
 pub enum AStackType<LexemeT, ActionT> {
@@ -312,6 +594,7 @@ where
     ) -> Option<ActionT> {
         let mut recoverer = None;
         let mut recovery_budget = Duration::from_millis(RECOVERY_TIME_BUDGET);
+        let mut delimiter_state = DelimiterState::default();
         loop {
             debug_assert_eq!(astack.len(), spans.len());
             let stidx = *pstack.last().unwrap();
@@ -347,6 +630,7 @@ where
                 }
                 Action::Shift(state_id) => {
                     let la_lexeme = self.next_lexeme(laidx);
+                    delimiter_state.observe_real_lexeme(self.lexer.span_str(la_lexeme.span()));
                     pstack.push(state_id);
                     astack.push(AStackType::Lexeme(la_lexeme));
 
@@ -383,11 +667,19 @@ where
 
                     let before = Instant::now();
                     let finish_by = before + recovery_budget;
-                    let (new_laidx, repairs, recovery_stats) = recoverer
+                    let (new_laidx, repairs, new_delimiter_state, recovery_stats) = recoverer
                         .as_ref()
                         .unwrap()
                         .as_ref()
-                        .recover(finish_by, self, laidx, pstack, astack, spans);
+                        .recover(
+                            finish_by,
+                            self,
+                            laidx,
+                            pstack,
+                            astack,
+                            spans,
+                            &delimiter_state,
+                        );
                     let after = Instant::now();
                     recovery_budget = recovery_budget
                         .checked_sub(after - before)
@@ -407,6 +699,7 @@ where
                         return None;
                     }
                     laidx = new_laidx;
+                    delimiter_state = new_delimiter_state;
                 }
             }
         }
@@ -536,6 +829,13 @@ where
         }
     }
 
+    pub(super) fn delimiter_for_lexeme(
+        &self,
+        lexeme: &LexerTypesT::LexemeT,
+    ) -> Option<char> {
+        delimiter_char_from_text(self.lexer.span_str(lexeme.span()))
+    }
+
     /// Start parsing text at `laidx` (using the lexeme in `lexeme_prefix`, if it is not `None`,
     /// as the first lexeme) up to (but excluding) `end_laidx`. If an error is encountered, parsing
     /// immediately terminates (without recovery).
@@ -622,9 +922,11 @@ pub(super) trait Recoverer<
         in_pstack: &mut PStack<StorageT>,
         astack: &mut Vec<AStackType<LexerTypesT::LexemeT, ActionT>>,
         spans: &mut Vec<Span>,
+        delimiter_state: &DelimiterState,
     ) -> (
         usize,
         Vec<Vec<ParseRepair<LexerTypesT::LexemeT, StorageT>>>,
+        DelimiterState,
         RecoveryStats,
     );
 }
@@ -665,6 +967,12 @@ pub struct RecoveryStats {
     pub repair_sequences_after_simplification: Option<u64>,
     /// Minimum successful CPCT+ repair cost found, if a success node was reached.
     pub minimum_recovery_cost: Option<u16>,
+    /// Number of popped configurations observed at each deterministic delimiter score.
+    pub delimiter_score_distribution: BTreeMap<i64, u64>,
+    /// Scores of successful configurations at the minimum CPCT+ repair cost.
+    pub minimum_cost_success_delimiter_scores: Vec<i64>,
+    /// Structural score of the repair sequence selected by the unchanged CPCT+ ranking.
+    pub selected_repair_delimiter_score: Option<i64>,
     /// Whether recovery stopped because it reached its deadline.
     pub timed_out: bool,
     /// Wall-clock duration spent in this recovery attempt.

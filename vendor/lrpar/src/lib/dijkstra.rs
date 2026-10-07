@@ -16,11 +16,12 @@ use super::parser::RecoveryStats;
 /// The name of this function isn't entirely accurate: this isn't Dijkstra's original algorithm or
 /// one of its well-known variants. However, unlike the astar_all function it doesn't expect a
 /// heuristic and it also filters out some duplicates.
-pub(crate) fn dijkstra<N, FM, FN, FS>(
+pub(crate) fn dijkstra<N, FM, FN, FS, FScore>(
     start_node: N,
     neighbours: FN,
     merge: FM,
     success: FS,
+    delimiter_score: FScore,
     stats: &mut RecoveryStats,
 ) -> Vec<N>
 where
@@ -28,6 +29,7 @@ where
     FN: Fn(bool, &N, &mut Vec<(u16, N)>, &mut RecoveryStats) -> bool,
     FM: Fn(&mut N, N, &mut RecoveryStats),
     FS: Fn(&N) -> bool,
+    FScore: Fn(&N) -> i64,
 {
     let mut scs_nodes = Vec::new();
     let mut todo: Vec<IndexMap<N, N>> = vec![indexmap![start_node.clone() => start_node]];
@@ -44,8 +46,11 @@ where
 
         let (_, n) = todo[usize::from(c)].pop().unwrap();
         stats.configurations_popped += 1;
+        let score = delimiter_score(&n);
+        *stats.delimiter_score_distribution.entry(score).or_default() += 1;
         if success(&n) {
             stats.minimum_recovery_cost = Some(c);
+            stats.minimum_cost_success_delimiter_scores.push(score);
             scs_nodes.push(n);
             break;
         }
@@ -87,7 +92,10 @@ where
         .unwrap();
     while let Some((_, n)) = scs_todo.pop() {
         stats.configurations_popped += 1;
+        let score = delimiter_score(&n);
+        *stats.delimiter_score_distribution.entry(score).or_default() += 1;
         if success(&n) {
+            stats.minimum_cost_success_delimiter_scores.push(score);
             scs_nodes.push(n);
             continue;
         }

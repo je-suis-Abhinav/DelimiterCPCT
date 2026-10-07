@@ -19,7 +19,11 @@ use num_traits::{AsPrimitive, PrimInt, Unsigned};
 use super::{
     Lexeme, LexerTypes,
     dijkstra::dijkstra,
-    parser::{AStackType, ParseRepair, Parser, Recoverer, RecoveryStats},
+    parser::{
+        AStackType, DelimiterScoreContext, DelimiterState, ParseRepair, Parser, Recoverer,
+        RecoveryStats,
+        delimiter_char_from_terminal_name,
+    },
 };
 
 const PARSE_AT_LEAST: usize = 3; // N in Corchuelo et al.
@@ -48,6 +52,7 @@ struct PathFNode<StorageT> {
     laidx: usize,
     repairs: Cactus<RepairMerge<StorageT>>,
     cf: u16,
+    delimiter_states: Vec<DelimiterState>,
 }
 
 impl<StorageT: PrimInt + Unsigned> PathFNode<StorageT> {
@@ -154,13 +159,17 @@ where
         in_pstack: &mut Vec<StIdx<StorageT>>,
         astack: &mut Vec<AStackType<LexerTypesT::LexemeT, ActionT>>,
         spans: &mut Vec<Span>,
+        delimiter_state: &DelimiterState,
     ) -> (
         usize,
         Vec<Vec<ParseRepair<LexerTypesT::LexemeT, StorageT>>>,
+        DelimiterState,
         RecoveryStats,
     ) {
         let started = Instant::now();
         let mut stats = RecoveryStats::default();
+        let error_delimiter = parser.delimiter_for_lexeme(&parser.next_lexeme(in_laidx));
+        let delimiter_score_context = DelimiterScoreContext::new(delimiter_state, error_delimiter);
         // This function implements a minor variant of the algorithm from "Repairing syntax errors
         // in LR parsers" by Rafael Corchuelo, Jose A. Perez, Antonio Ruiz, and Miguel Toro.
         //
@@ -187,6 +196,7 @@ where
             laidx: in_laidx,
             repairs: Cactus::new().child(RepairMerge::Terminator),
             cf: 0,
+            delimiter_states: vec![delimiter_state.clone()],
         };
         let astar_cnds = dijkstra(
             start_node,
@@ -217,6 +227,11 @@ where
             |old, new, stats| {
                 // merge new_n into old_n
 
+                for state in new.delimiter_states {
+                    if !old.delimiter_states.contains(&state) {
+                        old.delimiter_states.push(state);
+                    }
+                }
                 if old.repairs == new.repairs {
                     stats.configurations_discarded_duplicate += 1;
                     stats.configurations_discarded += 1;
@@ -251,18 +266,25 @@ where
                     Action::Accept
                 )
             },
+            |n| {
+                n.delimiter_states
+                    .iter()
+                    .map(|state| delimiter_score_context.score(state))
+                    .max()
+                    .unwrap_or_default()
+            },
             &mut stats,
         );
 
         if astar_cnds.is_empty() {
             stats.elapsed = started.elapsed();
-            return (in_laidx, vec![], stats);
+            return (in_laidx, vec![], delimiter_state.clone(), stats);
         }
 
         let Some(full_rprs) = self.collect_repairs(finish_by, in_laidx, astar_cnds) else {
             stats.timed_out = true;
             stats.elapsed = started.elapsed();
-            return (in_laidx, vec![], stats);
+            return (in_laidx, vec![], delimiter_state.clone(), stats);
         };
         stats.repair_sequences_after_collection =
             Some(full_rprs.iter().map(|repairs| repairs.len() as u64).sum());
@@ -274,10 +296,14 @@ where
         }
         if rnk_rprs.is_empty() {
             stats.elapsed = started.elapsed();
-            return (in_laidx, vec![], stats);
+            return (in_laidx, vec![], delimiter_state.clone(), stats);
         }
         simplify_repairs(parser, &mut rnk_rprs);
         stats.repair_sequences_after_simplification = Some(rnk_rprs.len() as u64);
+        let mut recovered_delimiter_state = delimiter_state.clone();
+        apply_delimiter_repairs(parser, &mut recovered_delimiter_state, &rnk_rprs[0]);
+        stats.selected_repair_delimiter_score =
+            Some(delimiter_score_context.score(&recovered_delimiter_state));
         let laidx = apply_repairs(
             parser,
             in_laidx,
@@ -288,7 +314,7 @@ where
         );
 
         stats.elapsed = started.elapsed();
-        (laidx, rnk_rprs, stats)
+        (laidx, rnk_rprs, recovered_delimiter_state, stats)
     }
 }
 
@@ -341,6 +367,11 @@ where
                         .cf
                         .checked_add(u16::from((self.parser.token_cost)(tidx)))
                         .unwrap(),
+                    delimiter_states: advance_inserted_terminal(
+                        self.parser,
+                        &n.delimiter_states,
+                        tidx,
+                    ),
                 };
                 nbrs.push((nn.cf, nn));
             }
@@ -365,6 +396,7 @@ where
             laidx: n.laidx + 1,
             repairs: n.repairs.child(RepairMerge::Repair(Repair::Delete)),
             cf: n.cf.checked_add(u16::from(cost)).unwrap(),
+            delimiter_states: n.delimiter_states.clone(),
         };
         nbrs.push((nn.cf, nn));
     }
@@ -414,6 +446,15 @@ where
                 laidx: new_laidx,
                 repairs: n_repairs,
                 cf: n.cf,
+                delimiter_states: if new_laidx > laidx {
+                    advance_real_lexeme(
+                        self.parser,
+                        &n.delimiter_states,
+                        &self.parser.next_lexeme(laidx),
+                    )
+                } else {
+                    n.delimiter_states.clone()
+                },
             };
             nbrs.push((nn.cf, nn));
         }
@@ -500,6 +541,109 @@ where
                 }
             })
             .collect()
+    }
+}
+
+fn delimiter_for_terminal<
+    'a,
+    'b: 'a,
+    'input: 'b,
+    StorageT: 'static + Debug + Eq + Hash + PrimInt + Unsigned,
+    LexerTypesT: LexerTypes<StorageT = StorageT>,
+    ActionT: 'a,
+    ParamT: Clone,
+>(
+    parser: &Parser<'a, 'b, 'input, StorageT, LexerTypesT, ActionT, ParamT>,
+    tidx: TIdx<StorageT>,
+) -> Option<char>
+where
+    usize: AsPrimitive<StorageT>,
+{
+    [parser.grm.token_name(tidx), parser.grm.token_epp(tidx)]
+        .into_iter()
+        .flatten()
+        .find_map(delimiter_char_from_terminal_name)
+}
+
+fn advance_inserted_terminal<
+    'a,
+    'b: 'a,
+    'input: 'b,
+    StorageT: 'static + Debug + Eq + Hash + PrimInt + Unsigned,
+    LexerTypesT: LexerTypes<StorageT = StorageT>,
+    ActionT: 'a,
+    ParamT: Clone,
+>(
+    parser: &Parser<'a, 'b, 'input, StorageT, LexerTypesT, ActionT, ParamT>,
+    states: &[DelimiterState],
+    tidx: TIdx<StorageT>,
+) -> Vec<DelimiterState>
+where
+    usize: AsPrimitive<StorageT>,
+{
+    let mut states = states.to_vec();
+    if let Some(delimiter) = delimiter_for_terminal(parser, tidx) {
+        for state in &mut states {
+            state.observe(delimiter);
+        }
+    }
+    states
+}
+
+fn advance_real_lexeme<
+    'a,
+    'b: 'a,
+    'input: 'b,
+    StorageT: 'static + Debug + Eq + Hash + PrimInt + Unsigned,
+    LexerTypesT: LexerTypes<StorageT = StorageT>,
+    ActionT: 'a,
+    ParamT: Clone,
+>(
+    parser: &Parser<'a, 'b, 'input, StorageT, LexerTypesT, ActionT, ParamT>,
+    states: &[DelimiterState],
+    lexeme: &LexerTypesT::LexemeT,
+) -> Vec<DelimiterState>
+where
+    usize: AsPrimitive<StorageT>,
+{
+    let mut states = states.to_vec();
+    if let Some(delimiter) = parser.delimiter_for_lexeme(lexeme) {
+        for state in &mut states {
+            state.observe(delimiter);
+        }
+    }
+    states
+}
+
+fn apply_delimiter_repairs<
+    'a,
+    'b: 'a,
+    'input: 'b,
+    StorageT: 'static + Debug + Eq + Hash + PrimInt + Unsigned,
+    LexerTypesT: LexerTypes<StorageT = StorageT>,
+    ActionT: 'a,
+    ParamT: Clone,
+>(
+    parser: &Parser<'a, 'b, 'input, StorageT, LexerTypesT, ActionT, ParamT>,
+    state: &mut DelimiterState,
+    repairs: &[ParseRepair<LexerTypesT::LexemeT, StorageT>],
+) where
+    usize: AsPrimitive<StorageT>,
+{
+    for repair in repairs {
+        match repair {
+            ParseRepair::Insert(tidx) => {
+                if let Some(delimiter) = delimiter_for_terminal(parser, *tidx) {
+                    state.observe(delimiter);
+                }
+            }
+            ParseRepair::Delete(_) => {}
+            ParseRepair::Shift(lexeme) => {
+                if let Some(delimiter) = parser.delimiter_for_lexeme(lexeme) {
+                    state.observe(delimiter);
+                }
+            }
+        }
     }
 }
 

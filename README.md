@@ -176,6 +176,29 @@ status is set when the recovery algorithm explicitly stops because its
 deadline has been reached. These measurements include instrumentation overhead;
 they are descriptive search metrics, not evidence of a performance improvement.
 
+The stats API and `--recovery-stats` CLI also report delimiter scores. The
+score is computed observationally for each popped configuration from its
+carried delimiter-state alternatives and a context snapshot at the parser-error
+lookahead. Higher scores indicate structural progress:
+
+- `+3` for each opening delimiter present at the error that is no longer
+  outstanding, and `-3` for each newly outstanding opening;
+- `+2` for each newly matched pair;
+- `-4` for each newly unexpected or mismatched closing delimiter;
+- `+2`, `+3`, or `+4` when the parser-error closing delimiter has a matching
+  opening on top of the stack, for matching, mismatched, or unexpected-close
+  contexts respectively.
+
+For merged configurations, the reported configuration score is the maximum
+score among its carried delimiter states. `delimiter_score_distribution` is a
+histogram over popped configurations; `minimum_cost_success_delimiter_scores`
+records the scores of successful configurations at the minimum CPCT+ cost; and
+`selected_repair_delimiter_score` scores the repair selected by the existing
+continuation filtering and simplification. Scores do not participate in
+frontier ordering, pruning, merging, continuation filtering, or repair
+selection. They use only the grammar-neutral delimiter stack and current
+lookahead, not grammar productions or the project-level checkpoint scanner.
+
 ## API Limitations Noted
 
 This baseline exposes the parser result and the pretty-printed `lrpar` parser

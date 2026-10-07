@@ -92,6 +92,12 @@ fn print_recovery_stats(stats: &[lrpar::RecoveryStats]) {
             recovery.timed_out,
             recovery.elapsed.as_nanos()
         );
+        println!(
+            "  delimiter scores: popped={:?}, minimum_cost_success={:?}, selected_repair={:?}",
+            recovery.delimiter_score_distribution,
+            recovery.minimum_cost_success_delimiter_scores,
+            recovery.selected_repair_delimiter_score
+        );
     }
 }
 
