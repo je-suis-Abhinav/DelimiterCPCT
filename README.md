@@ -4,8 +4,10 @@ This repository currently contains the baseline parser for the research project
 "Delimiter-Aware Extension of CPCT+ for Efficient and Localized LR Parser Error
 Recovery".
 
-The baseline is intentionally small and unmodified. It uses `lrlex` and `lrpar`
-to parse integer expressions with addition, multiplication, and parentheses:
+The baseline uses the original `lrpar` 0.15.0 CPCT+ algorithm to parse integer
+expressions with addition, multiplication, and parentheses. The local `lrpar`
+source copy adds read-only search instrumentation; it does not alter CPCT+
+decisions or repair results.
 
 - integer literals
 - `+`
@@ -45,6 +47,7 @@ The generated modules are included with:
 cargo run -- "1+2*3"
 cargo run -- "1+*"
 cargo run -- --observe-delimiters "((1+2)*3"
+cargo run -- --recovery-stats "1+*"
 ```
 
 The program prints whether parsing succeeded, recovered through baseline CPCT+,
@@ -53,6 +56,11 @@ the reported parser errors and repair sequences exposed by `lrpar`.
 
 With `--observe-delimiters`, the program still runs the same baseline parser and
 also prints the independent delimiter observation report.
+
+With `--recovery-stats`, the same CPCT+ implementation reports per-recovery
+search counters, repair-sequence counts, minimum recovery cost, timeout status,
+and elapsed time. This mode only observes the search; it does not change
+candidate generation, merging, costs, continuation ranking, or repair selection.
 
 ## Delimiter Observation
 
@@ -139,12 +147,41 @@ parser integration with observation enabled.
 - `((1+2)`
 - `1+2)`
 
+## CPCT+ Recovery Statistics
+
+The local `lrpar` 0.15.0 source copy adds `RecoveryStats` and
+`ParseError::recovery_stats()`. The project-level additive API is
+`parse_baseline_with_recovery_stats`, which returns the unchanged
+`BaselineReport` together with one statistics record for each parser error that
+invoked CPCT+ recovery. Accepted inputs have no recovery records.
+
+Counters are collected inside CPCT+ and its cost-bucket search. “Generated”
+counts neighbor candidates offered to the frontier (not the initial node);
+“popped” counts unique frontier entries removed and checked for success.
+“Merged” counts frontier key collisions (including exact duplicate histories).
+Discard counters distinguish same-cost-closure cost rejects, deadline leftovers,
+higher-cost nodes after minimum-cost discovery, and identical histories ignored
+during merging. Duplicate-history events are therefore included in both the
+merged counter and the discarded-reason total; the discard total itself is the
+sum of disjoint discard reasons.
+Transition-attempt counters count each non-EOF insertion terminal considered,
+each delete transition call (including calls at EOF), and each shift/reduction
+transition call. Repair-sequence counts are measured after collection, after
+continuation filtering, and after simplification/deduplication. These counts are
+`None` when recovery does not reach the corresponding stage, such as when the
+search finds no success node or times out during collection.
+
+Elapsed time is the wall-clock time within a single recovery attempt. Timeout
+status is set when the recovery algorithm explicitly stops because its
+deadline has been reached. These measurements include instrumentation overhead;
+they are descriptive search metrics, not evidence of a performance improvement.
+
 ## API Limitations Noted
 
 This baseline exposes the parser result and the pretty-printed `lrpar` parser
 errors, including repair sequences. When CPCT+ inserts a token such as `INT`,
 the semantic action may be unable to compute a numeric value because the
-inserted token has no source lexeme. It does not expose internal CPCT+ search
-configuration counts, memory usage, or recovery runtime metrics through this
-entry point. Future benchmarking must only report metrics that are actually
-measured or exposed by the selected APIs.
+inserted token has no source lexeme. CPCT+ now exposes internal search counts
+and recovery timing, but does not provide peak-memory measurements. Future
+benchmarking must only report metrics that are actually measured or exposed by
+the selected APIs.

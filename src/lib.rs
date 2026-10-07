@@ -1,5 +1,5 @@
 use lrlex::lrlex_mod;
-use lrpar::{LexError, LexParseError, Lexeme, NonStreamingLexer, lrpar_mod};
+use lrpar::{LexError, LexParseError, Lexeme, NonStreamingLexer, RecoveryStats, lrpar_mod};
 
 pub mod delimiter;
 pub mod localization;
@@ -31,9 +31,41 @@ pub struct ObservedBaselineReport {
 }
 
 pub fn parse_baseline(input: &str) -> BaselineReport {
+    parse_baseline_internal(input, false).0
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaselineRecoveryStatsReport {
+    pub baseline: BaselineReport,
+    /// One entry for each parser error that invoked CPCT+ recovery.
+    pub recovery_stats: Vec<RecoveryStats>,
+}
+
+pub fn parse_baseline_with_recovery_stats(input: &str) -> BaselineRecoveryStatsReport {
+    let (baseline, recovery_stats) = parse_baseline_internal(input, true);
+    BaselineRecoveryStatsReport {
+        baseline,
+        recovery_stats,
+    }
+}
+
+fn parse_baseline_internal(
+    input: &str,
+    collect_recovery_stats: bool,
+) -> (BaselineReport, Vec<RecoveryStats>) {
     let lexerdef = expr_l::lexerdef();
     let lexer = lexerdef.lexer(input);
     let (res, errs) = expr_y::parse(&lexer);
+    let recovery_stats = if collect_recovery_stats {
+        errs.iter()
+            .filter_map(|error| match error {
+                LexParseError::ParseError(parse_error) => parse_error.recovery_stats().cloned(),
+                LexParseError::LexError(_) => None,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     let error_positions = errs
         .iter()
         .map(|e| parser_error_position(input, &lexer, e))
@@ -57,13 +89,16 @@ pub fn parse_baseline(input: &str) -> BaselineReport {
         (None, _, false) => BaselineStatus::Failed,
     };
 
-    BaselineReport {
-        input: input.to_string(),
-        status,
-        value,
-        errors,
-        error_positions,
-    }
+    (
+        BaselineReport {
+            input: input.to_string(),
+            status,
+            value,
+            errors,
+            error_positions,
+        },
+        recovery_stats,
+    )
 }
 
 pub fn parse_baseline_with_delimiter_observation(input: &str) -> ObservedBaselineReport {
@@ -97,7 +132,10 @@ fn parser_error_position(
 
 #[cfg(test)]
 mod tests {
-    use super::{BaselineStatus, parse_baseline, parse_baseline_with_delimiter_observation};
+    use super::{
+        BaselineStatus, parse_baseline, parse_baseline_with_delimiter_observation,
+        parse_baseline_with_recovery_stats,
+    };
 
     #[test]
     fn valid_expressions_parse_without_recovery() {
@@ -126,6 +164,76 @@ mod tests {
                 "{input}: {report:#?}"
             );
         }
+    }
+
+    #[test]
+    fn recovery_stats_are_additive_and_preserve_baseline_results() {
+        let cases = [
+            (
+                "1+*",
+                "Parsing error at line 1 column 3. Repair sequences found:\n   1: Insert INT, Delete *\n   2: Insert INT, Shift *, Insert INT",
+                2,
+                2,
+            ),
+            (
+                "(1+2",
+                "Parsing error at line 1 column 5. Repair sequences found:\n   1: Insert )",
+                1,
+                1,
+            ),
+            (
+                "1+2)",
+                "Parsing error at line 1 column 4. Repair sequences found:\n   1: Delete )",
+                1,
+                1,
+            ),
+        ];
+
+        for (input, expected_error, repair_count, expected_cost) in cases {
+            let baseline = parse_baseline(input);
+            let instrumented = parse_baseline_with_recovery_stats(input);
+            assert_eq!(instrumented.baseline, baseline, "{input}");
+            assert_eq!(baseline.errors, [expected_error], "{input}");
+            assert_eq!(instrumented.recovery_stats.len(), 1, "{input}");
+
+            let stats = &instrumented.recovery_stats[0];
+            assert!(stats.configurations_generated > 0, "{input}: {stats:#?}");
+            assert!(stats.configurations_popped > 0, "{input}: {stats:#?}");
+            assert!(
+                stats.insert_transitions_attempted > 0,
+                "{input}: {stats:#?}"
+            );
+            assert!(
+                stats.delete_transitions_attempted > 0,
+                "{input}: {stats:#?}"
+            );
+            assert!(stats.shift_transitions_attempted > 0, "{input}: {stats:#?}");
+            assert_eq!(
+                stats.configurations_discarded,
+                stats.configurations_discarded_cost
+                    + stats.configurations_discarded_timeout
+                    + stats.configurations_discarded_higher_cost
+                    + stats.configurations_discarded_duplicate,
+                "{input}: {stats:#?}"
+            );
+            assert_eq!(
+                stats.repair_sequences_after_simplification,
+                Some(repair_count),
+                "{input}: {stats:#?}"
+            );
+            assert_eq!(
+                stats.minimum_recovery_cost,
+                Some(expected_cost),
+                "{input}: {stats:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepted_input_has_no_recovery_statistics() {
+        let report = parse_baseline_with_recovery_stats("1+2*3");
+        assert_eq!(report.baseline.status, BaselineStatus::Accepted);
+        assert!(report.recovery_stats.is_empty());
     }
 
     #[test]

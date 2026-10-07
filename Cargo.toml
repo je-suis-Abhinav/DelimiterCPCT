@@ -12,3 +12,6 @@ lrpar = "0.15.0"
 cfgrammar = "0.15.0"
 lrlex = "0.15.0"
 lrpar = "0.15.0"
+
+[patch.crates-io]
+lrpar = { path = "vendor/lrpar" }

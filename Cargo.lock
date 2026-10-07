@@ -229,8 +229,6 @@ dependencies = [
 [[package]]
 name = "lrpar"
 version = "0.15.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8f284d5f489a7968ececa72cbb2e8a5c99b63ffe2a34165756ce2ac63d228ef2"
 dependencies = [
  "cactus",
  "cfgrammar",

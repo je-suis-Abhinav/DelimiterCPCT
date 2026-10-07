@@ -2,20 +2,24 @@ use std::{env, io};
 
 use DelimiterCPCT::{
     BaselineStatus, delimiter::DelimiterReport, parse_baseline,
-    parse_baseline_with_delimiter_observation,
+    parse_baseline_with_delimiter_observation, parse_baseline_with_recovery_stats,
 };
 
 fn main() {
     let mut observe = false;
+    let mut show_recovery_stats = false;
     let input = env::args()
         .skip(1)
-        .filter(|arg| {
-            if arg == "--observe-delimiters" {
+        .filter(|arg| match arg.as_str() {
+            "--observe-delimiters" => {
                 observe = true;
                 false
-            } else {
-                true
             }
+            "--recovery-stats" => {
+                show_recovery_stats = true;
+                false
+            }
+            _ => true,
         })
         .collect::<Vec<_>>()
         .join(" ");
@@ -30,17 +34,64 @@ fn main() {
     };
 
     if input.trim().is_empty() {
-        eprintln!("Usage: cargo run -- [--observe-delimiters] \"1+2*3\"");
+        eprintln!("Usage: cargo run -- [--observe-delimiters] [--recovery-stats] \"1+2*3\"");
         return;
     }
 
-    if observe {
+    if show_recovery_stats {
+        let report = parse_baseline_with_recovery_stats(&input);
+        print_baseline(&report.baseline);
+        print_recovery_stats(&report.recovery_stats);
+        if observe {
+            print_delimiters(&DelimiterCPCT::delimiter::observe_delimiters(&input));
+        }
+    } else if observe {
         let report = parse_baseline_with_delimiter_observation(&input);
         print_baseline(&report.baseline);
         print_delimiters(&report.delimiters);
     } else {
         let report = parse_baseline(&input);
         print_baseline(&report);
+    }
+}
+
+fn print_recovery_stats(stats: &[lrpar::RecoveryStats]) {
+    if stats.is_empty() {
+        println!("CPCT+ recovery statistics: none");
+        return;
+    }
+
+    for (index, recovery) in stats.iter().enumerate() {
+        println!("CPCT+ recovery statistics #{}:", index + 1);
+        println!(
+            "  configurations: generated={}, popped={}, merged={}, discarded={} (cost={}, timeout={}, higher_cost={}, duplicate={})",
+            recovery.configurations_generated,
+            recovery.configurations_popped,
+            recovery.configurations_merged,
+            recovery.configurations_discarded,
+            recovery.configurations_discarded_cost,
+            recovery.configurations_discarded_timeout,
+            recovery.configurations_discarded_higher_cost,
+            recovery.configurations_discarded_duplicate
+        );
+        println!(
+            "  transition attempts: insert={}, delete={}, shift/reduction={}",
+            recovery.insert_transitions_attempted,
+            recovery.delete_transitions_attempted,
+            recovery.shift_transitions_attempted
+        );
+        println!(
+            "  repair sequences: collected={:?}, after_continuation={:?}, after_simplification={:?}",
+            recovery.repair_sequences_after_collection,
+            recovery.repair_sequences_after_continuation,
+            recovery.repair_sequences_after_simplification
+        );
+        println!(
+            "  minimum_recovery_cost={:?}, timed_out={}, elapsed_ns={}",
+            recovery.minimum_recovery_cost,
+            recovery.timed_out,
+            recovery.elapsed.as_nanos()
+        );
     }
 }
 
