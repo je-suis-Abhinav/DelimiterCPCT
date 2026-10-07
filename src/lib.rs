@@ -3,6 +3,7 @@ use lrpar::{
     LexError, LexParseError, Lexeme, NonStreamingLexer, RecoveryKind, RecoveryStats, lrpar_mod,
 };
 
+pub mod benchmark;
 pub mod delimiter;
 pub mod localization;
 

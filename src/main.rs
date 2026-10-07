@@ -6,12 +6,17 @@ use DelimiterCPCT::{
 };
 
 fn main() {
+    let mut run_benchmark = false;
     let mut observe = false;
     let mut show_recovery_stats = false;
     let mut delimiter_dominance = false;
     let input = env::args()
         .skip(1)
         .filter(|arg| match arg.as_str() {
+            "--benchmark" => {
+                run_benchmark = true;
+                false
+            }
             "--observe-delimiters" => {
                 observe = true;
                 false
@@ -28,6 +33,10 @@ fn main() {
         })
         .collect::<Vec<_>>()
         .join(" ");
+    if run_benchmark {
+        print!("{}", DelimiterCPCT::benchmark::benchmark_tsv());
+        return;
+    }
     let input = if input.is_empty() {
         let mut buf = String::new();
         io::stdin()

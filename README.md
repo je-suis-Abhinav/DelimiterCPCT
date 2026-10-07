@@ -50,6 +50,7 @@ cargo run -- "1+*"
 cargo run -- --observe-delimiters "((1+2)*3"
 cargo run -- --recovery-stats "1+*"
 cargo run -- --delimiter-dominance --recovery-stats "1+*"
+cargo run --release -- --benchmark > cpct-benchmark.tsv
 ```
 
 The program prints whether parsing succeeded, recovered through baseline CPCT+,
@@ -64,6 +65,22 @@ counters, repair-sequence counts, minimum recovery cost, timeout status, and
 elapsed time. By default, this mode only observes the search. The optional
 `--delimiter-dominance` flag enables the experimental rule documented below.
 The Rust API exposes the same OFF-by-default control with `RecoveryOptions`.
+
+`--benchmark` runs a fixed ten-input corpus once with dominance OFF and once
+with dominance ON per input, then writes TSV to standard output. The corpus
+includes valid controls; missing/unexpected delimiters; mismatched, nested, and
+multiple unmatched delimiters; operator errors; and delimiter-heavy errors.
+`parse_runtime_ns` measures the complete parse-and-statistics call;
+`cpct_elapsed_ns` and search counters come directly from `RecoveryStats`.
+Per-recovery costs and post-simplification repair counts are semicolon-separated
+when one input triggers multiple recovery attempts. Empty fields mean the parser
+did not expose a recovery value for that input (for example, a valid control
+does not invoke CPCT+). Localization data is produced independently by the
+existing delimiter scanner/localizer. The expression lexer accepts parentheses
+but not braces/brackets, so those rows can include lexer errors and delimiter
+observations without CPCT+ recovery metrics. Runtime fields are measured values,
+not deterministic test fixtures; use the same build profile and machine when
+comparing runs.
 
 ## Delimiter Observation
 
