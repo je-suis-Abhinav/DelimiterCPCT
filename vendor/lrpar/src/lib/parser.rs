@@ -128,13 +128,38 @@ pub(super) enum DelimiterCloseContext {
     Unexpected,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum DelimiterOriginKind {
+    Real,
+    Inserted { ordinal: u64 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct DelimiterOrigin {
+    pub(super) input_index: usize,
+    pub(super) char_index: usize,
+    pub(super) byte_index: usize,
+    pub(super) kind: DelimiterOriginKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct DelimiterFrame {
+    pub(super) kind: DelimiterKind,
+    pub(super) input_index: usize,
+    pub(super) char_index: usize,
+    pub(super) byte_index: usize,
+    pub(super) depth: usize,
+    pub(super) origin_kind: DelimiterOriginKind,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct DelimiterState {
-    stack: Vec<DelimiterKind>,
-    matched_delimiters: u64,
-    unexpected_closings: u64,
-    mismatched_closings: u64,
+    pub(super) stack: Vec<DelimiterFrame>,
+    pub(super) matched_delimiters: u64,
+    pub(super) unexpected_closings: u64,
+    pub(super) mismatched_closings: u64,
     max_depth: usize,
+    inserted_origin_count: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -150,8 +175,8 @@ impl DelimiterScoreContext {
     pub(super) fn new(state: &DelimiterState, error_delimiter: Option<char>) -> Self {
         let error_closing = error_delimiter.and_then(|delimiter| {
             let closing = DelimiterKind::from_close(delimiter)?;
-            let context = match state.stack.last() {
-                Some(opening) if *opening == closing => DelimiterCloseContext::MatchingOpening,
+            let context = match state.stack.last().map(|frame| frame.kind) {
+                Some(opening) if opening == closing => DelimiterCloseContext::MatchingOpening,
                 Some(_) => DelimiterCloseContext::MismatchedOpening,
                 None => DelimiterCloseContext::Unexpected,
             };
@@ -159,7 +184,7 @@ impl DelimiterScoreContext {
         });
 
         Self {
-            initial_stack: state.stack.clone(),
+            initial_stack: state.stack.iter().map(|frame| frame.kind).collect(),
             initial_matched_delimiters: state.matched_delimiters,
             initial_unexpected_closings: state.unexpected_closings,
             initial_mismatched_closings: state.mismatched_closings,
@@ -176,8 +201,8 @@ impl DelimiterScoreContext {
         let shared_prefix = self
             .initial_stack
             .iter()
-            .zip(&state.stack)
-            .take_while(|(initial, current)| initial == current)
+            .zip(state.stack.iter().map(|frame| frame.kind))
+            .take_while(|(initial, current)| *initial == current)
             .count();
         let resolved_openings = self.initial_stack.len().saturating_sub(shared_prefix);
         let added_openings = state.stack.len().saturating_sub(shared_prefix);
@@ -200,7 +225,7 @@ impl DelimiterScoreContext {
             .saturating_sub(to_score_count(unexpected).saturating_mul(4))
             .saturating_sub(to_score_count(mismatched).saturating_mul(4));
         if let Some((closing, context)) = self.error_closing
-            && state.stack.last() == Some(&closing)
+            && state.stack.last().map(|frame| frame.kind) == Some(closing)
         {
             let context_bonus = match context {
                 DelimiterCloseContext::MatchingOpening => 2,
@@ -214,23 +239,62 @@ impl DelimiterScoreContext {
 }
 
 impl DelimiterState {
+    #[cfg(test)]
     pub(super) fn observe(&mut self, delimiter: char) {
+        self.observe_at(
+            delimiter,
+            DelimiterOrigin {
+                input_index: 0,
+                char_index: 0,
+                byte_index: 0,
+                kind: DelimiterOriginKind::Real,
+            },
+        );
+    }
+
+    pub(super) fn observe_at(&mut self, delimiter: char, mut origin: DelimiterOrigin) {
         if let Some(kind) = DelimiterKind::from_open(delimiter) {
-            self.stack.push(kind);
+            if matches!(origin.kind, DelimiterOriginKind::Inserted { .. }) {
+                origin.kind = DelimiterOriginKind::Inserted {
+                    ordinal: self.inserted_origin_count,
+                };
+                self.inserted_origin_count = self.inserted_origin_count.saturating_add(1);
+            }
+            let depth = self.stack.len() + 1;
+            self.stack.push(DelimiterFrame {
+                kind,
+                input_index: origin.input_index,
+                char_index: origin.char_index,
+                byte_index: origin.byte_index,
+                depth,
+                origin_kind: origin.kind,
+            });
             self.max_depth = self.max_depth.max(self.stack.len());
         } else if let Some(kind) = DelimiterKind::from_close(delimiter) {
             match self.stack.pop() {
-                Some(opening) if opening == kind => self.matched_delimiters += 1,
+                Some(opening) if opening.kind == kind => self.matched_delimiters += 1,
                 Some(_) => self.mismatched_closings += 1,
                 None => self.unexpected_closings += 1,
             }
         }
     }
 
-    pub(super) fn observe_real_lexeme(&mut self, text: &str) {
-        if let Some(delimiter) = delimiter_char_from_text(text) {
-            self.observe(delimiter);
-        }
+    pub(super) fn observe_inserted(
+        &mut self,
+        delimiter: char,
+        input_index: usize,
+        char_index: usize,
+        byte_index: usize,
+    ) {
+        self.observe_at(
+            delimiter,
+            DelimiterOrigin {
+                input_index,
+                char_index,
+                byte_index,
+                kind: DelimiterOriginKind::Inserted { ordinal: 0 },
+            },
+        );
     }
 }
 
@@ -258,8 +322,8 @@ pub(super) fn delimiter_char_from_terminal_name(name: &str) -> Option<char> {
 #[cfg(test)]
 mod delimiter_state_tests {
     use super::{
-        DelimiterKind, DelimiterScoreContext, DelimiterState,
-        delimiter_char_from_terminal_name,
+        DelimiterKind, DelimiterOrigin, DelimiterOriginKind, DelimiterScoreContext, DelimiterState,
+        delimiter_char_from_terminal_name, delimiter_char_from_text,
     };
 
     #[test]
@@ -282,7 +346,10 @@ mod delimiter_state_tests {
         state.observe('(');
         state.observe('[');
 
-        assert_eq!(state.stack, [DelimiterKind::Parenthesis, DelimiterKind::Bracket]);
+        assert_eq!(
+            state.stack.iter().map(|frame| frame.kind).collect::<Vec<_>>(),
+            [DelimiterKind::Parenthesis, DelimiterKind::Bracket]
+        );
         assert_eq!(state.max_depth, 2);
     }
 
@@ -303,11 +370,29 @@ mod delimiter_state_tests {
     #[test]
     fn real_shift_updates_delimiter_state_but_non_delimiters_do_not() {
         let mut state = DelimiterState::default();
-        state.observe_real_lexeme("(");
+        state.observe_at(
+            '(',
+            DelimiterOrigin {
+                input_index: 0,
+                char_index: 0,
+                byte_index: 0,
+                kind: DelimiterOriginKind::Real,
+            },
+        );
         let after_shift = state.clone();
-        state.observe_real_lexeme("identifier");
+        if delimiter_char_from_text("identifier").is_some() {
+            state.observe_at(
+                '(',
+                DelimiterOrigin {
+                    input_index: 1,
+                    char_index: 1,
+                    byte_index: 1,
+                    kind: DelimiterOriginKind::Real,
+                },
+            );
+        }
         assert_eq!(state, after_shift);
-        assert_eq!(state.stack, [DelimiterKind::Parenthesis]);
+        assert_eq!(state.stack[0].kind, DelimiterKind::Parenthesis);
     }
 
     #[test]
@@ -317,7 +402,29 @@ mod delimiter_state_tests {
         let after_delete = before_delete.clone();
 
         assert_eq!(after_delete, before_delete);
-        assert_eq!(after_delete.stack, [DelimiterKind::Bracket]);
+        assert_eq!(after_delete.stack[0].kind, DelimiterKind::Bracket);
+    }
+
+    #[test]
+    fn delimiter_frames_keep_source_and_inserted_origin_metadata() {
+        let mut state = DelimiterState::default();
+        state.observe_inserted('(', 4, 8, 10);
+        let inserted = state.stack[0];
+        assert_eq!(inserted.input_index, 4);
+        assert_eq!(inserted.char_index, 8);
+        assert_eq!(inserted.byte_index, 10);
+        assert_eq!(inserted.depth, 1);
+        assert_eq!(
+            inserted.origin_kind,
+            DelimiterOriginKind::Inserted { ordinal: 0 }
+        );
+
+        state.observe(')');
+        state.observe_inserted('(', 4, 8, 10);
+        assert_eq!(
+            state.stack[0].origin_kind,
+            DelimiterOriginKind::Inserted { ordinal: 1 }
+        );
     }
 
     #[test]
@@ -630,7 +737,19 @@ where
                 }
                 Action::Shift(state_id) => {
                     let la_lexeme = self.next_lexeme(laidx);
-                    delimiter_state.observe_real_lexeme(self.lexer.span_str(la_lexeme.span()));
+                    let byte_index = la_lexeme.span().start();
+                    if let Some(delimiter) = self.delimiter_for_lexeme(&la_lexeme) {
+                        let char_index = self.delimiter_char_index(byte_index);
+                        delimiter_state.observe_at(
+                            delimiter,
+                            DelimiterOrigin {
+                                input_index: laidx,
+                                char_index,
+                                byte_index,
+                                kind: DelimiterOriginKind::Real,
+                            },
+                        );
+                    }
                     pstack.push(state_id);
                     astack.push(AStackType::Lexeme(la_lexeme));
 
@@ -834,6 +953,13 @@ where
         lexeme: &LexerTypesT::LexemeT,
     ) -> Option<char> {
         delimiter_char_from_text(self.lexer.span_str(lexeme.span()))
+    }
+
+    pub(super) fn delimiter_char_index(&self, byte_index: usize) -> usize {
+        self.lexer
+            .span_str(Span::new(0, byte_index))
+            .chars()
+            .count()
     }
 
     /// Start parsing text at `laidx` (using the lexeme in `lexeme_prefix`, if it is not `None`,

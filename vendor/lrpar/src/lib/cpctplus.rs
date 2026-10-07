@@ -1,6 +1,6 @@
 use std::{
     cmp::Ordering,
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fmt::Debug,
     hash::{Hash, Hasher},
 };
@@ -20,8 +20,8 @@ use super::{
     Lexeme, LexerTypes,
     dijkstra::dijkstra,
     parser::{
-        AStackType, DelimiterScoreContext, DelimiterState, ParseRepair, Parser, Recoverer,
-        RecoveryStats,
+        AStackType, DelimiterOrigin, DelimiterOriginKind, DelimiterScoreContext, DelimiterState,
+        ParseRepair, Parser, Recoverer, RecoveryStats,
         delimiter_char_from_terminal_name,
     },
 };
@@ -42,26 +42,78 @@ enum Repair<StorageT> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum RepairMerge<StorageT> {
     Repair(Repair<StorageT>),
-    Merge(Repair<StorageT>, Cactus<Cactus<RepairMerge<StorageT>>>),
     Terminator,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RepairVariant<StorageT> {
+    repairs: Cactus<RepairMerge<StorageT>>,
+    delimiter_state: DelimiterState,
+}
+
+impl<StorageT: PrimInt + Unsigned> RepairVariant<StorageT> {
+    fn last_repair(&self) -> Option<Repair<StorageT>> {
+        match *self.repairs.val().unwrap() {
+            RepairMerge::Repair(r) => Some(r),
+            RepairMerge::Terminator => None,
+        }
+    }
+
+    fn trailing_shifts(&self) -> usize {
+        self.repairs
+            .vals()
+            .take_while(|repair| {
+                matches!(
+                    **repair,
+                    RepairMerge::Repair(Repair::Shift)
+                )
+            })
+            .count()
+    }
+
+    fn with_repair(&self, repair: Option<Repair<StorageT>>, delimiter_state: DelimiterState) -> Self {
+        Self {
+            repairs: repair.map_or_else(
+                || self.repairs.clone(),
+                |repair| self.repairs.child(RepairMerge::Repair(repair)),
+            ),
+            delimiter_state,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
 struct PathFNode<StorageT> {
     pstack: Cactus<StIdx<StorageT>>,
     laidx: usize,
-    repairs: Cactus<RepairMerge<StorageT>>,
     cf: u16,
-    delimiter_states: Vec<DelimiterState>,
+    variants: Vec<RepairVariant<StorageT>>,
+}
+
+struct RepairCandidate<LexemeT, StorageT>
+where
+    LexemeT: Lexeme<StorageT>,
+    StorageT: Hash,
+{
+    repairs: Vec<ParseRepair<LexemeT, StorageT>>,
+    delimiter_state: DelimiterState,
 }
 
 impl<StorageT: PrimInt + Unsigned> PathFNode<StorageT> {
     fn last_repair(&self) -> Option<Repair<StorageT>> {
-        match *self.repairs.val().unwrap() {
-            RepairMerge::Repair(r) => Some(r),
-            RepairMerge::Merge(x, _) => Some(x),
-            RepairMerge::Terminator => None,
-        }
+        self.variants.first().and_then(RepairVariant::last_repair)
+    }
+
+    fn continuation_compatible(&self, other: &Self) -> bool {
+        let (Some(self_variant), Some(other_variant)) =
+            (self.variants.first(), other.variants.first())
+        else {
+            return false;
+        };
+        let self_delete = self_variant.last_repair() == Some(Repair::Delete);
+        let other_delete = other_variant.last_repair() == Some(Repair::Delete);
+        self_delete == other_delete
+            && self_variant.trailing_shifts() == other_variant.trailing_shifts()
     }
 }
 
@@ -77,37 +129,27 @@ impl<StorageT: PrimInt + Unsigned> PartialEq for PathFNode<StorageT> {
         if self.laidx != other.laidx || self.pstack != other.pstack {
             return false;
         }
-        // The rest of this function is subtle: we're not looking for repair sequences which are
-        // exactly equivalent, but ones that are compatible. This is necessary so that we can merge
-        // compatible nodes. Our definition of compatible repair sequences is: they must end with
-        // exactly the same number of shifts (ending with zero shifts is fine); and if one repair
-        // sequence ends in a delete, the other must do so as well.
-
-        match (self.last_repair(), other.last_repair()) {
-            (Some(Repair::Delete), Some(Repair::Delete)) => (),
-            (Some(Repair::Delete), _) | (_, Some(Repair::Delete)) => return false,
-            (_, _) => (),
-        }
-
-        let num_shifts = |c: &Cactus<RepairMerge<StorageT>>| {
-            let mut n = 0;
-            for r in c.vals() {
-                match *r {
-                    RepairMerge::Repair(Repair::Shift) | RepairMerge::Merge(Repair::Shift, _) => {
-                        n += 1
-                    }
-                    _ => break,
-                }
-            }
-            n
-        };
-        let self_shifts = num_shifts(&self.repairs);
-        let other_shifts = num_shifts(&other.repairs);
-        self_shifts == other_shifts
+        // Compatible histories share their trailing-shift count and delete-ending status.
+        self.continuation_compatible(other)
     }
 }
 
 impl<StorageT: PrimInt + Unsigned> Eq for PathFNode<StorageT> {}
+
+fn merge_variants<StorageT: PrimInt + Unsigned>(
+    existing: &mut Vec<RepairVariant<StorageT>>,
+    incoming: Vec<RepairVariant<StorageT>>,
+) -> u64 {
+    let mut duplicates = 0;
+    for variant in incoming {
+        if existing.contains(&variant) {
+            duplicates += 1;
+        } else {
+            existing.push(variant);
+        }
+    }
+    duplicates
+}
 
 struct CPCTPlus<
     'a,
@@ -194,9 +236,11 @@ where
         let start_node = PathFNode {
             pstack: start_cactus_pstack,
             laidx: in_laidx,
-            repairs: Cactus::new().child(RepairMerge::Terminator),
             cf: 0,
-            delimiter_states: vec![delimiter_state.clone()],
+            variants: vec![RepairVariant {
+                repairs: Cactus::new().child(RepairMerge::Terminator),
+                delimiter_state: delimiter_state.clone(),
+            }],
         };
         let astar_cnds = dijkstra(
             start_node,
@@ -227,25 +271,9 @@ where
             |old, new, stats| {
                 // merge new_n into old_n
 
-                for state in new.delimiter_states {
-                    if !old.delimiter_states.contains(&state) {
-                        old.delimiter_states.push(state);
-                    }
-                }
-                if old.repairs == new.repairs {
-                    stats.configurations_discarded_duplicate += 1;
-                    stats.configurations_discarded += 1;
-                    // If the repair sequences are identical, then merging is pointless.
-                    return;
-                }
-                let merge = match *old.repairs.val().unwrap() {
-                    RepairMerge::Repair(r) => {
-                        RepairMerge::Merge(r, Cactus::new().child(new.repairs))
-                    }
-                    RepairMerge::Merge(r, ref v) => RepairMerge::Merge(r, v.child(new.repairs)),
-                    _ => unreachable!(),
-                };
-                old.repairs = old.repairs.parent().unwrap().child(merge);
+                let duplicate_histories = merge_variants(&mut old.variants, new.variants);
+                stats.configurations_discarded_duplicate += duplicate_histories;
+                stats.configurations_discarded += duplicate_histories;
             },
             |n| {
                 // Is n a success node?
@@ -255,7 +283,11 @@ where
                 // quickly becomes too big. There isn't a way of encoding this check in r3s_n, so
                 // we check instead for its result: if the last N ('PARSE_AT_LEAST' in this
                 // library) repairs are shifts, then we've found a success node.
-                if ends_with_parse_at_least_shifts(&n.repairs) {
+                if n
+                    .variants
+                    .first()
+                    .is_some_and(|variant| ends_with_parse_at_least_shifts(&variant.repairs))
+                {
                     return true;
                 }
 
@@ -267,9 +299,9 @@ where
                 )
             },
             |n| {
-                n.delimiter_states
+                n.variants
                     .iter()
-                    .map(|state| delimiter_score_context.score(state))
+                    .map(|variant| delimiter_score_context.score(&variant.delimiter_state))
                     .max()
                     .unwrap_or_default()
             },
@@ -287,7 +319,7 @@ where
             return (in_laidx, vec![], delimiter_state.clone(), stats);
         };
         stats.repair_sequences_after_collection =
-            Some(full_rprs.iter().map(|repairs| repairs.len() as u64).sum());
+            Some(full_rprs.iter().map(|candidates| candidates.len() as u64).sum());
         let mut rnk_rprs = rank_cnds(
             parser, finish_by, in_laidx, in_pstack, full_rprs, &mut stats,
         );
@@ -298,10 +330,9 @@ where
             stats.elapsed = started.elapsed();
             return (in_laidx, vec![], delimiter_state.clone(), stats);
         }
-        simplify_repairs(parser, &mut rnk_rprs);
+        simplify_repairs(parser, &mut rnk_rprs, delimiter_state, in_laidx);
         stats.repair_sequences_after_simplification = Some(rnk_rprs.len() as u64);
-        let mut recovered_delimiter_state = delimiter_state.clone();
-        apply_delimiter_repairs(parser, &mut recovered_delimiter_state, &rnk_rprs[0]);
+        let recovered_delimiter_state = rnk_rprs[0].delimiter_state.clone();
         stats.selected_repair_delimiter_score =
             Some(delimiter_score_context.score(&recovered_delimiter_state));
         let laidx = apply_repairs(
@@ -310,11 +341,16 @@ where
             in_pstack,
             &mut Some(astack),
             &mut Some(spans),
-            &rnk_rprs[0],
+            &rnk_rprs[0].repairs,
         );
 
         stats.elapsed = started.elapsed();
-        (laidx, rnk_rprs, recovered_delimiter_state, stats)
+        (
+            laidx,
+            rnk_rprs.into_iter().map(|candidate| candidate.repairs).collect(),
+            recovered_delimiter_state,
+            stats,
+        )
     }
 }
 
@@ -360,18 +396,26 @@ where
                 let nn = PathFNode {
                     pstack: n_pstack,
                     laidx: n.laidx,
-                    repairs: n
-                        .repairs
-                        .child(RepairMerge::Repair(Repair::InsertTerm(tidx))),
                     cf: n
                         .cf
                         .checked_add(u16::from((self.parser.token_cost)(tidx)))
                         .unwrap(),
-                    delimiter_states: advance_inserted_terminal(
-                        self.parser,
-                        &n.delimiter_states,
-                        tidx,
-                    ),
+                    variants: n
+                        .variants
+                        .iter()
+                        .map(|variant| {
+                            let delimiter_state = advance_inserted_terminal(
+                                self.parser,
+                                &variant.delimiter_state,
+                                tidx,
+                                laidx,
+                            );
+                            variant.with_repair(
+                                Some(Repair::InsertTerm(tidx)),
+                                delimiter_state,
+                            )
+                        })
+                        .collect(),
                 };
                 nbrs.push((nn.cf, nn));
             }
@@ -394,9 +438,14 @@ where
         let nn = PathFNode {
             pstack: n.pstack.clone(),
             laidx: n.laidx + 1,
-            repairs: n.repairs.child(RepairMerge::Repair(Repair::Delete)),
             cf: n.cf.checked_add(u16::from(cost)).unwrap(),
-            delimiter_states: n.delimiter_states.clone(),
+            variants: n
+                .variants
+                .iter()
+                .map(|variant| {
+                    variant.with_repair(Some(Repair::Delete), variant.delimiter_state.clone())
+                })
+                .collect(),
         };
         nbrs.push((nn.cf, nn));
     }
@@ -436,25 +485,30 @@ where
             self.parser
                 .lr_cactus(None, laidx, laidx + 1, n.pstack.clone(), &mut None);
         if n.pstack != n_pstack {
-            let n_repairs = if new_laidx > laidx {
-                n.repairs.child(RepairMerge::Repair(Repair::Shift))
-            } else {
-                n.repairs.clone()
-            };
             let nn = PathFNode {
                 pstack: n_pstack,
                 laidx: new_laidx,
-                repairs: n_repairs,
                 cf: n.cf,
-                delimiter_states: if new_laidx > laidx {
-                    advance_real_lexeme(
-                        self.parser,
-                        &n.delimiter_states,
-                        &self.parser.next_lexeme(laidx),
-                    )
-                } else {
-                    n.delimiter_states.clone()
-                },
+                variants: n
+                    .variants
+                    .iter()
+                    .map(|variant| {
+                        let delimiter_state = if new_laidx > laidx {
+                            advance_real_lexeme(
+                                self.parser,
+                                &variant.delimiter_state,
+                                &self.parser.next_lexeme(laidx),
+                                laidx,
+                            )
+                        } else {
+                            variant.delimiter_state.clone()
+                        };
+                        variant.with_repair(
+                            (new_laidx > laidx).then_some(Repair::Shift),
+                            delimiter_state,
+                        )
+                    })
+                    .collect(),
             };
             nbrs.push((nn.cf, nn));
         }
@@ -467,7 +521,7 @@ where
         finish_by: Instant,
         in_laidx: usize,
         cnds: Vec<PathFNode<StorageT>>,
-    ) -> Option<Vec<Vec<Vec<ParseRepair<LexerTypesT::LexemeT, StorageT>>>>> {
+    ) -> Option<Vec<Vec<RepairCandidate<LexerTypesT::LexemeT, StorageT>>>> {
         fn traverse<StorageT: PrimInt>(
             finish_by: Instant,
             rm: &Cactus<RepairMerge<StorageT>>,
@@ -482,25 +536,9 @@ where
                     if parents.is_empty() {
                         out.push(vec![r]);
                     } else {
-                        for mut pc in parents {
-                            pc.push(r);
-                            out.push(pc);
-                        }
-                    }
-                }
-                RepairMerge::Merge(r, ref vc) => {
-                    let parents = traverse(finish_by, &rm.parent().unwrap())?;
-                    if parents.is_empty() {
-                        out.push(vec![r]);
-                    } else {
-                        for mut pc in parents {
-                            pc.push(r);
-                            out.push(pc);
-                        }
-                    }
-                    for c in vc.vals() {
-                        for pc in traverse(finish_by, c)? {
-                            out.push(pc);
+                        for mut parent in parents {
+                            parent.push(r);
+                            out.push(parent);
                         }
                     }
                 }
@@ -511,12 +549,16 @@ where
 
         let mut all_rprs = Vec::with_capacity(cnds.len());
         for cnd in cnds {
-            all_rprs.push(
-                traverse(finish_by, &cnd.repairs)?
-                    .into_iter()
-                    .map(|x| self.repair_to_parse_repair(in_laidx, &x))
-                    .collect::<Vec<_>>(),
-            );
+            let mut candidates = Vec::new();
+            for variant in cnd.variants {
+                for history in traverse(finish_by, &variant.repairs)? {
+                    candidates.push(RepairCandidate {
+                        repairs: self.repair_to_parse_repair(in_laidx, &history),
+                        delimiter_state: variant.delimiter_state.clone(),
+                    });
+                }
+            }
+            all_rprs.push(candidates);
         }
         Some(all_rprs)
     }
@@ -575,19 +617,20 @@ fn advance_inserted_terminal<
     ParamT: Clone,
 >(
     parser: &Parser<'a, 'b, 'input, StorageT, LexerTypesT, ActionT, ParamT>,
-    states: &[DelimiterState],
+    state: &DelimiterState,
     tidx: TIdx<StorageT>,
-) -> Vec<DelimiterState>
+    laidx: usize,
+) -> DelimiterState
 where
     usize: AsPrimitive<StorageT>,
 {
-    let mut states = states.to_vec();
+    let mut state = state.clone();
     if let Some(delimiter) = delimiter_for_terminal(parser, tidx) {
-        for state in &mut states {
-            state.observe(delimiter);
-        }
+        let byte_index = parser.next_lexeme(laidx).span().start();
+        let char_index = parser.delimiter_char_index(byte_index);
+        state.observe_inserted(delimiter, laidx, char_index, byte_index);
     }
-    states
+    state
 }
 
 fn advance_real_lexeme<
@@ -600,19 +643,28 @@ fn advance_real_lexeme<
     ParamT: Clone,
 >(
     parser: &Parser<'a, 'b, 'input, StorageT, LexerTypesT, ActionT, ParamT>,
-    states: &[DelimiterState],
+    state: &DelimiterState,
     lexeme: &LexerTypesT::LexemeT,
-) -> Vec<DelimiterState>
+    laidx: usize,
+) -> DelimiterState
 where
     usize: AsPrimitive<StorageT>,
 {
-    let mut states = states.to_vec();
+    let mut state = state.clone();
     if let Some(delimiter) = parser.delimiter_for_lexeme(lexeme) {
-        for state in &mut states {
-            state.observe(delimiter);
-        }
+        let byte_index = lexeme.span().start();
+        let char_index = parser.delimiter_char_index(byte_index);
+        state.observe_at(
+            delimiter,
+            DelimiterOrigin {
+                input_index: laidx,
+                char_index,
+                byte_index,
+                kind: DelimiterOriginKind::Real,
+            },
+        );
     }
-    states
+    state
 }
 
 fn apply_delimiter_repairs<
@@ -626,6 +678,7 @@ fn apply_delimiter_repairs<
 >(
     parser: &Parser<'a, 'b, 'input, StorageT, LexerTypesT, ActionT, ParamT>,
     state: &mut DelimiterState,
+    mut laidx: usize,
     repairs: &[ParseRepair<LexerTypesT::LexemeT, StorageT>],
 ) where
     usize: AsPrimitive<StorageT>,
@@ -634,14 +687,19 @@ fn apply_delimiter_repairs<
         match repair {
             ParseRepair::Insert(tidx) => {
                 if let Some(delimiter) = delimiter_for_terminal(parser, *tidx) {
-                    state.observe(delimiter);
+                    let byte_index = parser.next_lexeme(laidx).span().start();
+                    let char_index = parser.delimiter_char_index(byte_index);
+                    state.observe_inserted(delimiter, laidx, char_index, byte_index);
                 }
             }
-            ParseRepair::Delete(_) => {}
+            ParseRepair::Delete(_) => {
+                laidx += 1;
+            }
             ParseRepair::Shift(lexeme) => {
-                if let Some(delimiter) = parser.delimiter_for_lexeme(lexeme) {
-                    state.observe(delimiter);
-                }
+                let updated =
+                    advance_real_lexeme(parser, state, lexeme, laidx);
+                *state = updated;
+                laidx += 1;
             }
         }
     }
@@ -690,33 +748,49 @@ where
 
 /// Simplifies repair sequences, removes duplicates, and sorts them into order.
 fn simplify_repairs<
-    StorageT: 'static + Eq + Hash + PrimInt + Unsigned,
+    StorageT: 'static + Debug + Eq + Hash + PrimInt + Unsigned,
     LexerTypesT: LexerTypes<StorageT = StorageT>,
     ActionT,
     ParamT: Clone,
 >(
     parser: &Parser<StorageT, LexerTypesT, ActionT, ParamT>,
-    all_rprs: &mut Vec<Vec<ParseRepair<LexerTypesT::LexemeT, StorageT>>>,
+    all_rprs: &mut Vec<RepairCandidate<LexerTypesT::LexemeT, StorageT>>,
+    initial_delimiter_state: &DelimiterState,
+    in_laidx: usize,
 ) where
     usize: AsPrimitive<StorageT>,
 {
-    for rprs in &mut all_rprs.iter_mut() {
+    for candidate in all_rprs.iter_mut() {
         // Remove shifts from the end of repairs
-        while !rprs.is_empty() {
-            if let ParseRepair::Shift(_) = rprs[rprs.len() - 1] {
-                rprs.pop();
+        while !candidate.repairs.is_empty() {
+            if let ParseRepair::Shift(_) = candidate.repairs[candidate.repairs.len() - 1] {
+                candidate.repairs.pop();
             } else {
                 break;
             }
         }
+        candidate.delimiter_state = initial_delimiter_state.clone();
+        apply_delimiter_repairs(
+            parser,
+            &mut candidate.delimiter_state,
+            in_laidx,
+            &candidate.repairs,
+        );
     }
 
-    // Use a HashSet as a quick way of deduplicating repair sequences: occasionally we can end up
-    // with hundreds of thousands (!), and we don't have a sensible ordering on ParseRepair to make
-    // it plausible to do a sort and dedup.
-    let mut hs: HashSet<Vec<ParseRepair<LexerTypesT::LexemeT, StorageT>>> =
-        all_rprs.drain(..).collect();
-    all_rprs.extend(hs.drain());
+    let mut delimiter_states = HashMap::with_capacity(all_rprs.len());
+    let mut unique_repairs = HashSet::with_capacity(all_rprs.len());
+    for candidate in all_rprs.drain(..) {
+        unique_repairs.insert(candidate.repairs.clone());
+        let previous = delimiter_states.insert(candidate.repairs, candidate.delimiter_state.clone());
+        if let Some(previous) = previous {
+            debug_assert_eq!(previous, candidate.delimiter_state);
+        }
+    }
+    all_rprs.extend(unique_repairs.drain().map(|repairs| RepairCandidate {
+        delimiter_state: delimiter_states.remove(&repairs).unwrap(),
+        repairs,
+    }));
 
     // Sort repair sequences:
     //   1) by whether they contain Inserts that are %insert_avoid
@@ -732,14 +806,14 @@ fn simplify_repairs<
         false
     };
     all_rprs.sort_unstable_by(|x, y| {
-        let x_cai = contains_avoid_insert(x);
-        let y_cai = contains_avoid_insert(y);
+        let x_cai = contains_avoid_insert(&x.repairs);
+        let y_cai = contains_avoid_insert(&y.repairs);
         if x_cai && !y_cai {
             Ordering::Greater
         } else if !x_cai && y_cai {
             Ordering::Less
         } else {
-            x.len().cmp(&y.len())
+            x.repairs.len().cmp(&y.repairs.len())
         }
     });
 }
@@ -760,9 +834,9 @@ fn rank_cnds<
     finish_by: Instant,
     in_laidx: usize,
     in_pstack: &[StIdx<StorageT>],
-    in_cnds: Vec<Vec<Vec<ParseRepair<LexerTypesT::LexemeT, StorageT>>>>,
+    in_cnds: Vec<Vec<RepairCandidate<LexerTypesT::LexemeT, StorageT>>>,
     stats: &mut RecoveryStats,
-) -> Vec<Vec<ParseRepair<LexerTypesT::LexemeT, StorageT>>>
+) -> Vec<RepairCandidate<LexerTypesT::LexemeT, StorageT>>
 where
     usize: AsPrimitive<StorageT>,
 {
@@ -780,7 +854,7 @@ where
             &mut pstack,
             &mut None,
             &mut None,
-            &rpr_seqs[0],
+            &rpr_seqs[0].repairs,
         );
         laidx = parser.lr_upto(
             None,
@@ -813,7 +887,6 @@ fn ends_with_parse_at_least_shifts<StorageT: PrimInt + Unsigned>(
     for x in repairs.vals().take(PARSE_AT_LEAST) {
         match *x {
             RepairMerge::Repair(Repair::Shift) => shfts += 1,
-            RepairMerge::Merge(Repair::Shift, _) => shfts += 1,
             _ => return false,
         }
     }
@@ -822,17 +895,207 @@ fn ends_with_parse_at_least_shifts<StorageT: PrimInt + Unsigned>(
 
 #[cfg(test)]
 mod test {
+    use cactus::Cactus;
     use cfgrammar::yacc::YaccGrammar;
     use num_traits::ToPrimitive;
 
     use crate::{
         LexParseError, Lexeme, NonStreamingLexer,
         parser::{
+            DelimiterKind, DelimiterOrigin, DelimiterOriginKind, DelimiterState,
             ParseRepair, RecoveryKind,
             test::{SmallLexer, do_parse},
         },
         test_utils::{TestLexeme, TestLexerTypes},
     };
+    use super::{PathFNode, Repair, RepairMerge, RepairVariant, merge_variants};
+
+    fn delimiter_state(kind: char, input_index: usize, byte_index: usize) -> DelimiterState {
+        let mut state = DelimiterState::default();
+        state.observe_at(
+            kind,
+            DelimiterOrigin {
+                input_index,
+                char_index: byte_index,
+                byte_index,
+                kind: DelimiterOriginKind::Real,
+            },
+        );
+        state
+    }
+
+    fn repair_variant(
+        repair: Repair<u16>,
+        delimiter_state: DelimiterState,
+    ) -> RepairVariant<u16> {
+        RepairVariant {
+            repairs: Cactus::new()
+                .child(RepairMerge::Terminator)
+                .child(RepairMerge::Repair(repair)),
+            delimiter_state,
+        }
+    }
+
+    #[test]
+    fn merging_compatible_histories_keeps_each_paired_delimiter_state() {
+        let left = repair_variant(Repair::InsertTerm(cfgrammar::TIdx(1)), delimiter_state('(', 1, 2));
+        let right = repair_variant(Repair::InsertTerm(cfgrammar::TIdx(2)), delimiter_state('[', 2, 5));
+        let pstack = Cactus::new().child(lrtable::StIdx(0u16));
+        let left_node = PathFNode {
+            pstack: pstack.clone(),
+            laidx: 3,
+            cf: 1,
+            variants: vec![left.clone()],
+        };
+        let right_node = PathFNode {
+            pstack,
+            laidx: 3,
+            cf: 1,
+            variants: vec![right.clone()],
+        };
+
+        assert_eq!(left_node, right_node);
+        let mut variants = vec![left.clone()];
+
+        assert_ne!(left.last_repair(), right.last_repair());
+        assert_eq!(left.trailing_shifts(), right.trailing_shifts());
+        assert_eq!(merge_variants(&mut variants, vec![right.clone()]), 0);
+        assert_eq!(variants, [left.clone(), right.clone()]);
+        assert_eq!(variants[0].delimiter_state.stack[0].kind, DelimiterKind::Parenthesis);
+        assert_eq!(variants[1].delimiter_state.stack[0].kind, DelimiterKind::Bracket);
+    }
+
+    #[test]
+    fn paired_variants_update_independently_through_insert_delete_and_shift() {
+        let left = repair_variant(Repair::InsertTerm(cfgrammar::TIdx(1)), delimiter_state('(', 1, 2));
+        let right = repair_variant(Repair::InsertTerm(cfgrammar::TIdx(2)), delimiter_state('[', 2, 5));
+
+        let mut left_after_insert = left.delimiter_state.clone();
+        left_after_insert.observe_inserted(')', 3, 6, 6);
+        let left_after_insert =
+            left.with_repair(Some(Repair::InsertTerm(cfgrammar::TIdx(3))), left_after_insert);
+        let mut right_after_insert = right.delimiter_state.clone();
+        right_after_insert.observe_inserted(')', 3, 6, 6);
+        let right_after_insert =
+            right.with_repair(Some(Repair::InsertTerm(cfgrammar::TIdx(3))), right_after_insert);
+        assert_eq!(left_after_insert.delimiter_state.matched_delimiters, 1);
+        assert_eq!(right_after_insert.delimiter_state.mismatched_closings, 1);
+
+        let left_after_delete = left_after_insert.with_repair(
+            Some(Repair::Delete),
+            left_after_insert.delimiter_state.clone(),
+        );
+        let right_after_delete = right_after_insert.with_repair(
+            Some(Repair::Delete),
+            right_after_insert.delimiter_state.clone(),
+        );
+        assert_eq!(
+            left_after_delete.delimiter_state,
+            left_after_insert.delimiter_state
+        );
+        assert_eq!(
+            right_after_delete.delimiter_state,
+            right_after_insert.delimiter_state
+        );
+
+        let mut left_after_shift_state = left_after_delete.delimiter_state.clone();
+        left_after_shift_state.observe_at(
+            '{',
+            DelimiterOrigin {
+                input_index: 4,
+                char_index: 8,
+                byte_index: 9,
+                kind: DelimiterOriginKind::Real,
+            },
+        );
+        let mut right_after_shift_state = right_after_delete.delimiter_state.clone();
+        right_after_shift_state.observe_at(
+            '{',
+            DelimiterOrigin {
+                input_index: 4,
+                char_index: 8,
+                byte_index: 9,
+                kind: DelimiterOriginKind::Real,
+            },
+        );
+        let left_after_shift = left_after_delete.with_repair(
+            Some(Repair::Shift),
+            left_after_shift_state,
+        );
+        let right_after_shift = right_after_delete.with_repair(
+            Some(Repair::Shift),
+            right_after_shift_state,
+        );
+
+        assert_eq!(left_after_shift.delimiter_state.stack.len(), 1);
+        assert_eq!(right_after_shift.delimiter_state.stack.len(), 1);
+        assert_eq!(
+            left_after_shift.delimiter_state.stack[0].kind,
+            DelimiterKind::Brace
+        );
+        assert_eq!(
+            right_after_shift.delimiter_state.stack[0].kind,
+            DelimiterKind::Brace
+        );
+        assert_eq!(
+            left_after_shift.delimiter_state.matched_delimiters,
+            1
+        );
+        assert_eq!(
+            right_after_shift.delimiter_state.mismatched_closings,
+            1
+        );
+    }
+
+    #[test]
+    fn same_delimiter_kind_with_distinct_origins_remains_distinguishable() {
+        let first = repair_variant(Repair::InsertTerm(cfgrammar::TIdx(1)), delimiter_state('(', 1, 2));
+        let second = repair_variant(Repair::InsertTerm(cfgrammar::TIdx(2)), delimiter_state('(', 4, 12));
+        let mut variants = vec![first.clone()];
+        merge_variants(&mut variants, vec![second.clone()]);
+
+        assert_eq!(variants[0].delimiter_state.stack[0].kind, DelimiterKind::Parenthesis);
+        assert_eq!(variants[1].delimiter_state.stack[0].kind, DelimiterKind::Parenthesis);
+        assert_ne!(
+            variants[0].delimiter_state.stack[0].input_index,
+            variants[1].delimiter_state.stack[0].input_index
+        );
+        assert_ne!(
+            variants[0].delimiter_state.stack[0].byte_index,
+            variants[1].delimiter_state.stack[0].byte_index
+        );
+        assert_eq!(variants[0].delimiter_state.stack[0].depth, 1);
+        assert_eq!(variants[1].delimiter_state.stack[0].depth, 1);
+    }
+
+    #[test]
+    fn incompatible_continuation_states_do_not_compare_equal() {
+        let state = DelimiterState::default();
+        let base_stack = Cactus::new().child(lrtable::StIdx(0u16));
+        let make_node = |variant| PathFNode {
+            pstack: base_stack.clone(),
+            laidx: 3,
+            cf: 1,
+            variants: vec![variant],
+        };
+        let non_delete = make_node(repair_variant(
+            Repair::InsertTerm(cfgrammar::TIdx(1)),
+            state.clone(),
+        ));
+        let delete = make_node(repair_variant(Repair::Delete, state.clone()));
+        let shift = repair_variant(Repair::Shift, state.clone());
+        let two_shifts = RepairVariant {
+            repairs: shift
+                .repairs
+                .child(RepairMerge::Repair(Repair::Shift)),
+            delimiter_state: state,
+        };
+        let one_shift = make_node(shift);
+        let two_shifts = make_node(two_shifts);
+
+        assert_ne!(non_delete, delete);
+        assert_ne!(one_shift, two_shifts);
+    }
 
     fn pp_repairs(
         grm: &YaccGrammar<u16>,

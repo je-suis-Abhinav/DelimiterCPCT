@@ -6,8 +6,9 @@ Recovery".
 
 The baseline uses the original `lrpar` 0.15.0 CPCT+ algorithm to parse integer
 expressions with addition, multiplication, and parentheses. The local `lrpar`
-source copy adds read-only search instrumentation; it does not alter CPCT+
-decisions or repair results.
+source copy adds read-only search instrumentation and per-configuration
+delimiter/history metadata; neither influences CPCT+ decisions or repair
+results.
 
 - integer literals
 - `+`
@@ -98,8 +99,10 @@ Each opening delimiter creates a `DelimiterCheckpoint` containing:
 - optional closing position
 - parser state, currently `None`
 
-Parser state is not fabricated. This phase does not modify `lrpar` or CPCT+, so
-no internal parser state is recorded yet.
+The separate checkpoint scanner does not capture LR parser state, so its
+`parser_state` field remains `None`. The vendored parser separately carries
+delimiter opening origins with CPCT+ repair histories; this metadata does not
+alter parse or recovery decisions.
 
 Example checkpoint output:
 
@@ -119,6 +122,15 @@ There are now two execution paths:
 The second path only adds structural observation. It does not modify repair
 costs, prune configurations, rank repairs differently, add delimiter-specific
 grammar productions, or replace CPCT+.
+
+The vendored CPCT+ search also carries experimental delimiter metadata. Each
+repair-history variant remains paired with the delimiter state produced by
+that history, including opening kind, token/input index, character index, byte
+offset, nesting depth, and whether the opening was real or inserted. Compatible
+CPCT+ configurations still use the existing frontier grouping and
+continuation-control compatibility; metadata is kept paired when their repair
+histories are merged. This representation adds per-history storage and does
+not prune, reorder, change costs, or alter repair selection.
 
 ## Testing
 
