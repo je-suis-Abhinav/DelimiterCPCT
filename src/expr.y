@@ -13,6 +13,8 @@ Term -> Result<u64, ()>:
 
 Factor -> Result<u64, ()>:
       '(' Expr ')' { $2 }
+    | '{' Expr '}' { $2 }
+    | '[' Expr ']' { $2 }
     | 'INT'
       {
           let lexeme = $1.map_err(|_| ())?;
