@@ -4,20 +4,21 @@ This repository currently contains the baseline parser for the research project
 "Delimiter-Aware Extension of CPCT+ for Efficient and Localized LR Parser Error
 Recovery".
 
-The baseline uses the original `lrpar` 0.15.0 CPCT+ algorithm to parse integer
-expressions with addition, multiplication, and parentheses. The local `lrpar`
-source copy adds search instrumentation and per-configuration delimiter/history
-metadata. The default parser remains baseline CPCT+; an explicit experimental
-option enables strict-cost delimiter-aware dominance.
+With delimiter dominance disabled, the default parser preserves the original
+`lrpar` 0.15.0 CPCT+ repair semantics for integer expressions with addition,
+multiplication, and `()`, `{}`, and `[]` grouping. The vendored `lrpar` source
+still contains search instrumentation and per-configuration delimiter/history
+metadata. An explicit experimental option enables strict-cost
+delimiter-aware dominance.
 
 - integer literals
 - `+`
 - `*`
-- `(` and `)`
+- `(`, `)`, `{`, `}`, `[`, and `]` as equivalent grouping delimiters
 
-The baseline path remains unmodified. A separate delimiter-observation path now
-records structural delimiter information alongside baseline parsing, but it does
-not influence CPCT+ recovery.
+With dominance disabled, delimiter metadata and instrumentation do not alter
+CPCT+ repair behavior. A separate delimiter-observation path records structural
+delimiter information alongside parsing, without influencing CPCT+ recovery.
 
 ## Versions
 
@@ -77,9 +78,10 @@ Per-recovery costs and post-simplification repair counts are semicolon-separated
 when one input triggers multiple recovery attempts. Empty fields mean the parser
 did not expose a recovery value for that input (for example, a valid control
 does not invoke CPCT+). Localization data is produced independently by the
-existing delimiter scanner/localizer. The expression lexer accepts parentheses
-but not braces/brackets, so those rows can include lexer errors and delimiter
-observations without CPCT+ recovery metrics. Runtime fields are measured values,
+existing delimiter scanner/localizer. All six grouping-delimiter characters
+are lexer tokens, so malformed grouping cases in the corpus reach parser-level
+CPCT+ recovery; inputs containing other unsupported characters may still fail
+lexing. Runtime fields are measured values,
 not deterministic test fixtures; use the same build profile and machine when
 comparing runs.
 
@@ -108,9 +110,15 @@ It records:
 - mismatched closing delimiters
 - delimiter-origin checkpoints for every opening delimiter
 
-The tracker intentionally does not depend on the expression grammar. The current
-grammar only accepts parentheses, but the observation layer can still see braces
-and brackets in raw input without modifying `src/expr.y`.
+The tracker intentionally does not depend on the expression grammar. The
+expression grammar treats all three pairs as equivalent grouping delimiters,
+while retaining the existing arithmetic precedence and associativity.
+
+The parser remains an integer-expression grammar: it does not support
+identifiers, unary operators, division, strings, or comments. The structural
+scanner observes delimiter-looking characters in raw text and does not
+distinguish characters inside strings or comments; those constructs are outside
+this grammar.
 
 ## Checkpoints
 

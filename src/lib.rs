@@ -163,9 +163,39 @@ mod tests {
         parse_baseline_with_recovery_stats_and_options,
     };
 
+    fn normalized_repair_sets(errors: &[String]) -> Vec<Vec<String>> {
+        let mut repair_sets = errors
+            .iter()
+            .map(|error| {
+                let Some((_, repairs)) = error.split_once("Repair sequences found:\n") else {
+                    return Vec::new();
+                };
+                let mut repairs = repairs
+                    .lines()
+                    .filter_map(|line| line.trim().split_once(": ").map(|(_, repair)| repair))
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                repairs.sort();
+                repairs
+            })
+            .collect::<Vec<_>>();
+        repair_sets.sort();
+        repair_sets
+    }
+
     #[test]
     fn valid_expressions_parse_without_recovery() {
-        let cases = [("1+2", 3), ("1+2*3", 7), ("(1+2)*3", 9), ("((1+2)*3)", 9)];
+        let cases = [
+            ("1+2", 3),
+            ("1+2*3", 7),
+            ("(1+2)*3", 9),
+            ("{1+2}*3", 9),
+            ("[1+2]*3", 9),
+            ("((1+2)*3)", 9),
+            ("{{1+2}*[3+4]}", 21),
+            ("({[1+2]}*3)", 9),
+            ("[(1+2)*{3+4}]", 21),
+        ];
 
         for (input, expected) in cases {
             let report = parse_baseline(input);
@@ -177,7 +207,10 @@ mod tests {
 
     #[test]
     fn malformed_expressions_invoke_baseline_cpct_recovery() {
-        let cases = ["1+", "1+*", "(1+2", "1+2)", "((1+2)", "1+2)"];
+        let cases = [
+            "1+", "1+*", "(1+2", "{1+2", "[1+2", "1+2)", "1+2}", "1+2]", "([1+2)]", "{(1+2}]",
+            "[{1+2)]", "({[1+2", "(({1+2})", "1+2)+3",
+        ];
 
         for input in cases {
             let report = parse_baseline(input);
@@ -337,6 +370,68 @@ mod tests {
     }
 
     #[test]
+    fn all_grouping_delimiter_repairs_reach_cpct_and_match_off_on() {
+        let cases = [
+            "(1+2",       // missing )
+            "{1+2",       // missing }
+            "[1+2",       // missing ]
+            "1+2)",       // unexpected )
+            "1+2}",       // unexpected }
+            "1+2]",       // unexpected ]
+            "([1+2)]",    // crossed delimiters
+            "{(1+2}]",    // mismatched close and extra close
+            "[{1+2)]",    // mismatched close
+            "({[1+2",     // nested missing delimiters
+            "(({1+2})",   // multiple nested delimiters with a missing close
+            "({[1+*2]})", // delimiter imbalance with an operator error
+        ];
+
+        for input in cases {
+            let off =
+                parse_baseline_with_recovery_stats_and_options(input, RecoveryOptions::default());
+            let on = parse_baseline_with_recovery_stats_and_options(
+                input,
+                RecoveryOptions {
+                    delimiter_dominance: true,
+                },
+            );
+
+            assert!(
+                !off.recovery_stats.is_empty(),
+                "OFF did not invoke CPCT+ for lexically valid input {input:?}: {off:#?}"
+            );
+            assert_eq!(
+                on.recovery_stats.len(),
+                off.recovery_stats.len(),
+                "recovery attempts differ for {input:?}"
+            );
+            let off_repairs = normalized_repair_sets(&off.baseline.errors);
+            let on_repairs = normalized_repair_sets(&on.baseline.errors);
+            assert!(
+                off_repairs.iter().all(|repairs| !repairs.is_empty()),
+                "OFF did not expose the complete repair set for {input:?}: {:?}",
+                off.baseline.errors
+            );
+            assert_eq!(
+                on_repairs, off_repairs,
+                "minimum-cost repair sets differ for {input:?}: OFF={:?}, ON={:?}",
+                off.baseline.errors, on.baseline.errors
+            );
+            assert_eq!(
+                on.recovery_stats
+                    .iter()
+                    .map(|stats| stats.minimum_recovery_cost)
+                    .collect::<Vec<_>>(),
+                off.recovery_stats
+                    .iter()
+                    .map(|stats| stats.minimum_recovery_cost)
+                    .collect::<Vec<_>>(),
+                "minimum recovery costs differ for {input:?}"
+            );
+        }
+    }
+
+    #[test]
     fn default_recovery_options_keep_dominance_disabled() {
         let report = parse_baseline_with_recovery_stats("1+*");
         assert!(
@@ -349,7 +444,14 @@ mod tests {
 
     #[test]
     fn enabling_dominance_does_not_change_valid_parse_results() {
-        for input in ["1+2", "(1+2)*3", "((1+2)*3)"] {
+        for input in [
+            "1+2",
+            "(1+2)*3",
+            "{1+2}*3",
+            "[1+2]*3",
+            "((1+2)*3)",
+            "({[1+2]}*3)",
+        ] {
             let baseline = parse_baseline(input);
             let experimental = parse_baseline_with_options(
                 input,
@@ -370,7 +472,14 @@ mod tests {
 
     #[test]
     fn delimiter_observation_does_not_change_baseline_status_or_errors() {
-        let cases = ["(1+2)*3", "((1+2)*3", "1+2)", "({[1+2]})"];
+        let cases = [
+            "(1+2)*3",
+            "{1+2}*3",
+            "[1+2]*3",
+            "((1+2)*3",
+            "1+2)",
+            "({[1+2]})",
+        ];
 
         for input in cases {
             let baseline = parse_baseline(input);
@@ -404,13 +513,88 @@ mod tests {
         assert_eq!(extra_close.delimiters.checkpoints.len(), 0);
         assert_eq!(extra_close.delimiters.unexpected_closings.len(), 1);
 
-        let grammar_unsupported = parse_baseline_with_delimiter_observation("({[1+2]})");
-        assert_ne!(
-            grammar_unsupported.baseline.status,
-            BaselineStatus::Accepted
-        );
-        assert_eq!(grammar_unsupported.delimiters.checkpoints.len(), 3);
-        assert_eq!(grammar_unsupported.delimiters.matches.len(), 3);
-        assert_eq!(grammar_unsupported.delimiters.max_depth, 3);
+        let mixed = parse_baseline_with_delimiter_observation("({[1+2]})");
+        assert_eq!(mixed.baseline.status, BaselineStatus::Accepted);
+        assert_eq!(mixed.baseline.value, Some(3));
+        assert_eq!(mixed.delimiters.checkpoints.len(), 3);
+        assert_eq!(mixed.delimiters.matches.len(), 3);
+        assert_eq!(mixed.delimiters.max_depth, 3);
+    }
+
+    #[test]
+    fn delimiter_tracking_and_localization_preserve_kind_origin_and_depth() {
+        use crate::{
+            delimiter::DelimiterKind,
+            localization::{LocalizationReason, localize_structure},
+        };
+
+        for (input, kind, depth) in [
+            ("(1+2", DelimiterKind::Parenthesis, 1),
+            ("{1+2", DelimiterKind::Brace, 1),
+            ("[1+2", DelimiterKind::Bracket, 1),
+            ("({[1+2", DelimiterKind::Bracket, 3),
+        ] {
+            let observed = parse_baseline_with_delimiter_observation(input);
+            assert_eq!(
+                observed.baseline.status,
+                BaselineStatus::Recovered,
+                "{input}"
+            );
+            let candidate =
+                &localize_structure(&observed.baseline, &observed.delimiters).candidates[0];
+            assert_eq!(
+                candidate.reason,
+                LocalizationReason::UnmatchedOpening,
+                "{input}"
+            );
+            assert_eq!(candidate.delimiter, kind, "{input}");
+            assert_eq!(candidate.depth, depth, "{input}");
+            assert_eq!(
+                candidate.event_position.byte_offset,
+                input.find(kind.open_char()).unwrap()
+            );
+            assert_eq!(
+                candidate
+                    .checkpoint
+                    .as_ref()
+                    .map(|checkpoint| checkpoint.kind),
+                Some(kind),
+                "{input}"
+            );
+        }
+
+        for (input, kind) in [
+            ("1+2)", DelimiterKind::Parenthesis),
+            ("1+2}", DelimiterKind::Brace),
+            ("1+2]", DelimiterKind::Bracket),
+        ] {
+            let observed = parse_baseline_with_delimiter_observation(input);
+            assert_eq!(
+                observed.baseline.status,
+                BaselineStatus::Recovered,
+                "{input}"
+            );
+            let candidate =
+                &localize_structure(&observed.baseline, &observed.delimiters).candidates[0];
+            assert_eq!(
+                candidate.reason,
+                LocalizationReason::UnexpectedClosing,
+                "{input}"
+            );
+            assert_eq!(candidate.delimiter, kind, "{input}");
+            assert_eq!(
+                candidate.event_position.byte_offset,
+                input.len() - 1,
+                "{input}"
+            );
+        }
+
+        let mismatched = parse_baseline_with_delimiter_observation("{(1+2]");
+        let mismatch = &mismatched.delimiters.mismatched_closings[0];
+        assert_eq!(mismatch.opening_kind, DelimiterKind::Parenthesis);
+        assert_eq!(mismatch.opening_position.byte_offset, 1);
+        assert_eq!(mismatch.closing_kind, DelimiterKind::Bracket);
+        assert_eq!(mismatch.closing_position.byte_offset, 5);
+        assert_eq!(mismatch.depth, 2);
     }
 }
