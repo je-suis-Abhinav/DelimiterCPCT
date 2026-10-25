@@ -1,0 +1,9 @@
+C:\Users\Abhinav Ojha\OneDrive\Desktop\VIT\DelimiterCPCT\DelimiterCPCT\vendor\lrpar\target\debug\deps\pastey-233d145143151ed4.d: C:\Users\Abhinav\ Ojha\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\pastey-0.2.3\src\lib.rs C:\Users\Abhinav\ Ojha\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\pastey-0.2.3\src\attr.rs C:\Users\Abhinav\ Ojha\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\pastey-0.2.3\src\error.rs C:\Users\Abhinav\ Ojha\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\pastey-0.2.3\src\segment.rs C:\Users\Abhinav\ Ojha\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\pastey-0.2.3\src\../README.md
+
+C:\Users\Abhinav Ojha\OneDrive\Desktop\VIT\DelimiterCPCT\DelimiterCPCT\vendor\lrpar\target\debug\deps\pastey-233d145143151ed4.dll: C:\Users\Abhinav\ Ojha\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\pastey-0.2.3\src\lib.rs C:\Users\Abhinav\ Ojha\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\pastey-0.2.3\src\attr.rs C:\Users\Abhinav\ Ojha\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\pastey-0.2.3\src\error.rs C:\Users\Abhinav\ Ojha\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\pastey-0.2.3\src\segment.rs C:\Users\Abhinav\ Ojha\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\pastey-0.2.3\src\../README.md
+
+C:\Users\Abhinav\ Ojha\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\pastey-0.2.3\src\lib.rs:
+C:\Users\Abhinav\ Ojha\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\pastey-0.2.3\src\attr.rs:
+C:\Users\Abhinav\ Ojha\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\pastey-0.2.3\src\error.rs:
+C:\Users\Abhinav\ Ojha\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\pastey-0.2.3\src\segment.rs:
+C:\Users\Abhinav\ Ojha\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\pastey-0.2.3\src\../README.md:

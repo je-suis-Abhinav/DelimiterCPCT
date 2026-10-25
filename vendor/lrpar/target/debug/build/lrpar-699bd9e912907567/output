@@ -1,0 +1,5 @@
+cargo::rustc-check-cfg=cfg(grmtools_extra_checks)
+cargo:rustc-env=VERGEN_BUILD_TIMESTAMP=2026-10-07T19:00:41.215694400Z
+cargo:rerun-if-changed=build.rs
+cargo:rerun-if-env-changed=VERGEN_IDEMPOTENT
+cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH
