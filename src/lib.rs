@@ -48,6 +48,8 @@ pub struct BaselineRecoveryStatsReport {
 pub struct RecoveryOptions {
     /// Enable experimental strict-cost delimiter-aware dominance. Default is disabled.
     pub delimiter_dominance: bool,
+    /// Enable delimiter-origin prioritization within equal-cost CPCT+ frontier buckets.
+    pub delimiter_localization: bool,
 }
 
 pub fn parse_baseline_with_recovery_stats(input: &str) -> BaselineRecoveryStatsReport {
@@ -76,10 +78,16 @@ fn parse_baseline_internal(
 ) -> (BaselineReport, Vec<RecoveryStats>) {
     let lexerdef = expr_l::lexerdef();
     let lexer = lexerdef.lexer(input);
-    let (res, errs) = if options.delimiter_dominance {
-        expr_y::parse_with_recovery_kind(&lexer, RecoveryKind::CPCTPlusDelimiterDominance)
-    } else {
+    let recovery_kind = match (options.delimiter_dominance, options.delimiter_localization) {
+        (false, false) => RecoveryKind::CPCTPlus,
+        (true, false) => RecoveryKind::CPCTPlusDelimiterDominance,
+        (false, true) => RecoveryKind::CPCTPlusDelimiterLocalization,
+        (true, true) => RecoveryKind::CPCTPlusDelimiterDominanceAndLocalization,
+    };
+    let (res, errs) = if matches!(recovery_kind, RecoveryKind::CPCTPlus) {
         expr_y::parse(&lexer)
+    } else {
+        expr_y::parse_with_recovery_kind(&lexer, recovery_kind)
     };
     let recovery_stats = if collect_recovery_stats {
         errs.iter()
@@ -328,6 +336,7 @@ mod tests {
                 input,
                 RecoveryOptions {
                     delimiter_dominance: true,
+                    delimiter_localization: false,
                 },
             );
             assert_eq!(
@@ -361,6 +370,7 @@ mod tests {
             "1+2)",
             RecoveryOptions {
                 delimiter_dominance: true,
+                delimiter_localization: false,
             },
         );
         assert_eq!(
@@ -370,7 +380,7 @@ mod tests {
     }
 
     #[test]
-    fn all_grouping_delimiter_repairs_reach_cpct_and_match_off_on() {
+    fn all_four_modes_preserve_exhaustive_minimum_cost_repair_sets() {
         let cases = [
             "(1+2",       // missing )
             "{1+2",       // missing }
@@ -384,51 +394,202 @@ mod tests {
             "({[1+2",     // nested missing delimiters
             "(({1+2})",   // multiple nested delimiters with a missing close
             "({[1+*2]})", // delimiter imbalance with an operator error
+            "1+*",        // multiple equal-cost repair candidates
+            "1++2",       // ordinary operator error
+            "*1+2",       // ordinary prefix syntax error
+            "(1+*)",      // ordinary syntax error inside balanced delimiters
+        ];
+        let modes = [
+            RecoveryOptions::default(),
+            RecoveryOptions {
+                delimiter_dominance: true,
+                delimiter_localization: false,
+            },
+            RecoveryOptions {
+                delimiter_dominance: false,
+                delimiter_localization: true,
+            },
+            RecoveryOptions {
+                delimiter_dominance: true,
+                delimiter_localization: true,
+            },
         ];
 
         for input in cases {
-            let off =
-                parse_baseline_with_recovery_stats_and_options(input, RecoveryOptions::default());
-            let on = parse_baseline_with_recovery_stats_and_options(
-                input,
-                RecoveryOptions {
-                    delimiter_dominance: true,
-                },
-            );
-
+            let reports =
+                modes.map(|options| parse_baseline_with_recovery_stats_and_options(input, options));
+            let off = &reports[0];
             assert!(
                 !off.recovery_stats.is_empty(),
-                "OFF did not invoke CPCT+ for lexically valid input {input:?}: {off:#?}"
+                "CPCT+ was not invoked for {input:?}"
             );
-            assert_eq!(
-                on.recovery_stats.len(),
-                off.recovery_stats.len(),
-                "recovery attempts differ for {input:?}"
+            assert!(
+                off.recovery_stats.iter().all(|stats| !stats.timed_out),
+                "cannot compare a timed-out OFF search for {input:?}: {:#?}",
+                off.recovery_stats
             );
+            assert!(off.recovery_stats.iter().all(|stats| {
+                !stats.delimiter_dominance_enabled && !stats.delimiter_localization_enabled
+            }));
             let off_repairs = normalized_repair_sets(&off.baseline.errors);
-            let on_repairs = normalized_repair_sets(&on.baseline.errors);
             assert!(
                 off_repairs.iter().all(|repairs| !repairs.is_empty()),
-                "OFF did not expose the complete repair set for {input:?}: {:?}",
-                off.baseline.errors
+                "{input:?}"
             );
-            assert_eq!(
-                on_repairs, off_repairs,
-                "minimum-cost repair sets differ for {input:?}: OFF={:?}, ON={:?}",
-                off.baseline.errors, on.baseline.errors
+
+            for (options, experimental) in modes.into_iter().zip(reports.iter()).skip(1) {
+                assert!(
+                    experimental
+                        .recovery_stats
+                        .iter()
+                        .all(|stats| !stats.timed_out),
+                    "cannot claim exhaustive equivalence after timeout for {input:?}, \
+                     options={options:?}: {:#?}",
+                    experimental.recovery_stats
+                );
+                assert_eq!(
+                    experimental.recovery_stats.len(),
+                    off.recovery_stats.len(),
+                    "recovery attempts differ for {input:?}, options={options:?}"
+                );
+                assert_eq!(
+                    normalized_repair_sets(&experimental.baseline.errors),
+                    off_repairs,
+                    "minimum-cost repair sets differ for {input:?}, options={options:?}"
+                );
+                assert_eq!(
+                    experimental
+                        .recovery_stats
+                        .iter()
+                        .map(|stats| stats.minimum_recovery_cost)
+                        .collect::<Vec<_>>(),
+                    off.recovery_stats
+                        .iter()
+                        .map(|stats| stats.minimum_recovery_cost)
+                        .collect::<Vec<_>>(),
+                    "minimum recovery costs differ for {input:?}, options={options:?}"
+                );
+                assert!(experimental.recovery_stats.iter().all(|stats| {
+                    stats.delimiter_dominance_enabled == options.delimiter_dominance
+                        && stats.delimiter_localization_enabled == options.delimiter_localization
+                }));
+            }
+
+            if input == "1+*" {
+                assert_eq!(off_repairs.len(), 1);
+                assert_eq!(off_repairs[0].len(), 2);
+                for experimental in reports.iter().skip(1) {
+                    assert_eq!(
+                        normalized_repair_sets(&experimental.baseline.errors)[0].len(),
+                        2,
+                        "equal-cost alternatives were lost for {input:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn delimiter_localization_prioritizes_valid_cpct_configurations_and_records_positions() {
+        let input = "({[1+2";
+        let report = parse_baseline_with_recovery_stats_and_options(
+            input,
+            RecoveryOptions {
+                delimiter_dominance: false,
+                delimiter_localization: true,
+            },
+        );
+        let stats = &report.recovery_stats[0];
+        assert!(stats.delimiter_localization_enabled);
+        assert_eq!(
+            stats.localization_target.as_deref(),
+            Some("unmatched_opening")
+        );
+        assert_eq!(stats.localization_checkpoint_id, Some(2));
+        assert_eq!(stats.localization_delimiter, Some('['));
+        assert_eq!(stats.localization_origin_input_index, Some(2));
+        assert_eq!(stats.localization_origin_byte_index, Some(2));
+        assert_eq!(stats.localization_origin_char_index, Some(2));
+        assert_eq!(stats.localization_origin_depth, Some(3));
+        assert_eq!(stats.recovery_start_input_index, Some(6));
+        assert_eq!(stats.recovery_start_byte_index, Some(6));
+        assert!(stats.localization_priority_pops > 0, "{stats:#?}");
+        assert!(stats.localization_priority_reorders > 0, "{stats:#?}");
+        assert!(stats.final_repair_byte_index.is_some());
+        assert_eq!(stats.localization_to_recovery_start_distance, Some(4));
+        assert!(stats.localization_to_repair_distance.is_some());
+        assert!(stats.recovery_start_to_repair_distance.is_some());
+    }
+
+    #[test]
+    fn localization_does_not_target_balanced_delimiters_or_unrelated_syntax_errors() {
+        for input in ["(1+*)", "1+*"] {
+            let off =
+                parse_baseline_with_recovery_stats_and_options(input, RecoveryOptions::default());
+            let localized = parse_baseline_with_recovery_stats_and_options(
+                input,
+                RecoveryOptions {
+                    delimiter_dominance: false,
+                    delimiter_localization: true,
+                },
             );
+            assert_eq!(localized.baseline.errors, off.baseline.errors, "{input}");
             assert_eq!(
-                on.recovery_stats
+                normalized_repair_sets(&localized.baseline.errors),
+                normalized_repair_sets(&off.baseline.errors),
+                "{input}"
+            );
+            assert!(
+                localized
+                    .recovery_stats
                     .iter()
-                    .map(|stats| stats.minimum_recovery_cost)
-                    .collect::<Vec<_>>(),
-                off.recovery_stats
-                    .iter()
-                    .map(|stats| stats.minimum_recovery_cost)
-                    .collect::<Vec<_>>(),
-                "minimum recovery costs differ for {input:?}"
+                    .all(|stats| stats.localization_target.is_none()),
+                "{input}: {:#?}",
+                localized.recovery_stats
             );
         }
+    }
+
+    #[test]
+    fn localization_identifies_unexpected_and_mismatched_delimiter_origins() {
+        let unexpected = parse_baseline_with_recovery_stats_and_options(
+            "1+2}",
+            RecoveryOptions {
+                delimiter_dominance: false,
+                delimiter_localization: true,
+            },
+        );
+        let unexpected_stats = &unexpected.recovery_stats[0];
+        assert_eq!(
+            unexpected_stats.localization_target.as_deref(),
+            Some("unexpected_closing")
+        );
+        assert_eq!(unexpected_stats.localization_checkpoint_id, None);
+        assert_eq!(unexpected_stats.localization_delimiter, Some('}'));
+        assert_eq!(unexpected_stats.localization_origin_input_index, Some(3));
+        assert_eq!(unexpected_stats.localization_origin_byte_index, Some(3));
+        assert_eq!(unexpected_stats.localization_origin_char_index, Some(3));
+        assert_eq!(unexpected_stats.localization_origin_depth, Some(0));
+        assert_eq!(unexpected_stats.recovery_start_byte_index, Some(3));
+
+        let mismatched = parse_baseline_with_recovery_stats_and_options(
+            "([1+2)",
+            RecoveryOptions {
+                delimiter_dominance: false,
+                delimiter_localization: true,
+            },
+        );
+        let mismatch_stats = &mismatched.recovery_stats[0];
+        assert_eq!(
+            mismatch_stats.localization_target.as_deref(),
+            Some("mismatched_closing_opening")
+        );
+        assert_eq!(mismatch_stats.localization_checkpoint_id, Some(1));
+        assert_eq!(mismatch_stats.localization_delimiter, Some('['));
+        assert_eq!(mismatch_stats.localization_origin_input_index, Some(1));
+        assert_eq!(mismatch_stats.localization_origin_byte_index, Some(1));
+        assert_eq!(mismatch_stats.localization_origin_char_index, Some(1));
+        assert_eq!(mismatch_stats.localization_origin_depth, Some(2));
     }
 
     #[test]
@@ -457,6 +618,7 @@ mod tests {
                 input,
                 RecoveryOptions {
                     delimiter_dominance: true,
+                    delimiter_localization: false,
                 },
             );
             assert_eq!(experimental, baseline, "{input}");

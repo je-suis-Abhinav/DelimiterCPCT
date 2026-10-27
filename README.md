@@ -51,8 +51,10 @@ cargo run -- "1+*"
 cargo run -- --observe-delimiters "((1+2)*3"
 cargo run -- --recovery-stats "1+*"
 cargo run -- --delimiter-dominance --recovery-stats "1+*"
-cargo run --release -- --benchmark > cpct-benchmark.tsv
-cargo run --release -- --benchmark-summary
+cargo run -- --delimiter-localization --recovery-stats "({[1+2"
+cargo run -- --delimiter-localization --delimiter-dominance --recovery-stats "({[1+2"
+cargo run --release -- --benchmark --benchmark-trials 15 --benchmark-warmups 3 > cpct-raw.tsv
+cargo run --release -- --benchmark-summary-from cpct-raw.tsv > cpct-summary.tsv
 ```
 
 The program prints whether parsing succeeded, recovered through baseline CPCT+,
@@ -64,33 +66,70 @@ also prints the independent delimiter observation report.
 
 With `--recovery-stats`, the selected CPCT+ mode reports per-recovery search
 counters, repair-sequence counts, minimum recovery cost, timeout status, and
-elapsed time. By default, this mode only observes the search. The optional
-`--delimiter-dominance` flag enables the experimental rule documented below.
-The Rust API exposes the same OFF-by-default control with `RecoveryOptions`.
+elapsed time. The optional `--delimiter-dominance` flag enables strict-cost
+dominance, while `--delimiter-localization` independently enables
+delimiter-origin frontier prioritization. The Rust API exposes both
+OFF-by-default controls through `RecoveryOptions`.
 
-`--benchmark` runs a fixed ten-input corpus once with dominance OFF and once
-with dominance ON per input, then writes TSV to standard output. The corpus
-includes valid controls; missing/unexpected delimiters; mismatched, nested, and
-multiple unmatched delimiters; operator errors; and delimiter-heavy errors.
-`parse_runtime_ns` measures the complete parse-and-statistics call;
-`cpct_elapsed_ns` and search counters come directly from `RecoveryStats`.
-Per-recovery costs and post-simplification repair counts are semicolon-separated
-when one input triggers multiple recovery attempts. Empty fields mean the parser
-did not expose a recovery value for that input (for example, a valid control
-does not invoke CPCT+). Localization data is produced independently by the
-existing delimiter scanner/localizer. All six grouping-delimiter characters
-are lexer tokens, so malformed grouping cases in the corpus reach parser-level
-CPCT+ recovery; inputs containing other unsupported characters may still fail
-lexing. Runtime fields are measured values,
-not deterministic test fixtures; use the same build profile and machine when
-comparing runs.
+### Experimental benchmark
 
-`--benchmark-summary` runs the same corpus/modes and prints a compact TSV
-comparison. Reduction percentages are `(OFF - ON) / OFF * 100`; runtime change
-is `(ON - OFF) / OFF * 100` (positive means ON took longer). Exact OFF/ON
-generated, popped, runtime, cost, repair-count, and dominance-discard values
-are included alongside the percentages. `N/A` marks absent measurements or a
-zero OFF denominator, for which a percentage is undefined.
+Use `--benchmark` for machine-readable raw TSV or `--benchmark-summary` for
+per-case and aggregate statistics. Both accept `--benchmark-trials N` and
+`--benchmark-warmups N`; defaults are 5 measured trials and 1 warm-up, and at
+least one measured trial is required. Run both commands from a release build as
+shown above. The raw output records the build profile so a debug run is
+identifiable, but debug timings should not be used as performance evidence.
+
+Each measured trial is paired by input across the four modes. The fixed
+pseudo-random schedule deterministically shuffles mode order per case and trial
+to reduce systematic order/cache bias; warm-ups also execute all four modes.
+The corpus and ordering are reproducible, while runtime measurements and
+selection among equal-ranked repair ties are not. The summary command can
+summarize the exact raw run with `--benchmark-summary-from`; this is
+preferred so raw and aggregate values correspond to the same trials.
+Configuration counts are deterministic for a fixed build/input unless a
+recovery timeout makes a search incomplete.
+
+The 30-case corpus includes 10 valid controls (all delimiter types, mixed
+nests, depths 8/16/32, and expressions with 8/24 terms); 5 missing-close cases
+(each delimiter kind plus nesting depths 4/6); 3 unexpected closers; 3
+mismatched closers; nested/crossed delimiters; multiple unmatched openings;
+a delimiter-heavy cascading syntax error; 4 ordinary syntax errors; and an
+input with multiple equal-cost repairs. Corpus validation confirms lexically
+valid inputs and verifies that malformed cases invoke parser recovery while
+valid controls do not. Lexer failures are rejected rather than counted as
+recovery experiments.
+
+Raw rows contain input bytes and lexer token count excluding EOF, delimiter
+character count and scanner maximum depth, parse outcome/value availability,
+target OS/architecture, total parser-call and summed CPCT+ elapsed time, search
+counters, minimum repair cost and post-simplification repair counts, timeout
+state, and localization
+target/origin/recovery/repair positions. Empty recovery fields mean CPCT+ was
+not invoked. CPCT+ elapsed time and counters come from `RecoveryStats`; total
+runtime wraps the parse-and-statistics API and includes lexer/parser setup.
+
+Counter meanings follow `RecoveryStats`: generated counts neighbor candidates
+before merging/rejection; popped counts frontier entries checked for success;
+merged counts frontier-key collisions invoking the merge callback; discarded
+is the sum of reason counters and is not a unique-configuration count. Duplicate
+discard counts repair histories. Dominance removals count repair variants, not
+unique configurations. The summary reports per-case means of work counters,
+runtime median/mean/population-standard-deviation/minimum/maximum across trials,
+and an `__AGGREGATE__` row summing work and total runtime by paired trial across
+the corpus. Reduction is `(OFF/OFF - mode) / OFF/OFF * 100`; runtime change is
+`(mode - OFF/OFF) / OFF/OFF * 100`. `search_work_effect` distinguishes less,
+more, unchanged, and mixed generated/popped work; `runtime_effect` compares
+median total runtime. These classifications are descriptive, not statistical
+significance tests. Report search-count and runtime results separately; fewer
+configurations do not imply faster runtime.
+
+Searches that time out are marked incomplete. Their repair sets and costs must
+not be treated as exhaustive equivalence evidence; runtime summaries still
+include them and should be interpreted alongside timeout counts. The OFF/OFF
+mode is the instrumented vendored CPCT+ implementation with delimiter-aware
+features disabled, not a pristine untouched upstream lrpar baseline. A
+separate pristine-upstream comparison is not part of this harness.
 
 ## Delimiter Observation
 
@@ -136,8 +175,7 @@ Each opening delimiter creates a `DelimiterCheckpoint` containing:
 
 The separate checkpoint scanner does not capture LR parser state, so its
 `parser_state` field remains `None`. The vendored parser separately carries
-delimiter opening origins with CPCT+ repair histories; this metadata does not
-alter parse or recovery decisions.
+delimiter opening origins with CPCT+ repair histories.
 
 Example checkpoint output:
 
@@ -148,17 +186,57 @@ Checkpoint #1: delimiter=(, byte=1, char=1, delimiter_index=1, depth=2, matched=
 
 ## Baseline vs Observation
 
-There are now two execution paths:
+The parser offers these controls:
 
 - baseline CPCT+: `parse_baseline`
 - baseline CPCT+ plus delimiter observation:
   `parse_baseline_with_delimiter_observation`
 - opt-in strict-cost dominance:
   `parse_baseline_with_options` with `RecoveryOptions`
+- opt-in delimiter-origin localization: `RecoveryOptions` with
+  `delimiter_localization: true`
 
-The second path only adds structural observation. It does not modify repair
-costs, prune configurations, rank repairs differently, add delimiter-specific
-grammar productions, or replace CPCT+.
+Dominance and localization are independent options. With both disabled, the
+default repair semantics remain CPCT+; instrumentation and delimiter metadata
+are still present in vendored `lrpar`.
+
+## Delimiter-Origin Localization
+
+Localization is an optional exploration policy, separate from dominance. At
+each parser error it selects a relevant real delimiter origin when available:
+an active opening delimiter for an unmatched or mismatched case, or the current
+unexpected closing token. For unmatched openings, the implementation checks the
+remaining token stream so a balanced enclosing delimiter around an unrelated
+syntax error is not mistaken for an unmatched origin.
+
+CPCT+ still starts from the parser's actual error configuration (the live LR
+state stack, lookahead index, and semantic stack). It does **not** rewind the
+input or restart at the opening character: the project-level checkpoint scanner
+does not capture the LR and semantic-stack state required for a safe resume.
+Instead, localization prioritizes already valid CPCT+ frontier configurations
+that structurally resolve the selected target, but only within the same
+accumulated CPCT+ cost bucket. It does not remove configurations, change costs,
+or alter continuation ranking and final repair ranking. Thus CPCT+ minimum-cost
+semantics and the complete repair set returned by CPCT+'s existing continuation
+filter are retained when the search finishes without timeout. The final choice
+among equal-ranked repairs is not guaranteed to be identical: the baseline
+already leaves ties unordered, and frontier traversal can change which tied
+candidate is selected. Differential tests compare the complete reported repair
+sets and minimum costs for all four dominance/localization modes on a fixed
+corpus of all three delimiter kinds, nested/mixed and mismatched cases, multiple
+unmatched openings, and ordinary syntax errors. An earlier timeout can change
+which configurations are explored before termination; timed-out runs are
+incomplete and are not evidence of repair-set equivalence. The recovery start
+remains the parser-error position.
+
+When recovery statistics are requested, the report includes the selected
+target/checkpoint, its delimiter and origin position/depth, the actual recovery
+start, the selected repair's final operation position, origin-to-repair
+distance, origin-to-recovery-start distance, start-to-final-repair distance,
+and counts of prioritized/reordered frontier pops. `--benchmark` records those
+fields for each of the four dominance/localization combinations.
+These metrics demonstrate exploration influence, not an earlier parser restart
+or a measured performance improvement.
 
 The vendored CPCT+ search also carries experimental delimiter metadata. Each
 repair-history variant remains paired with the delimiter state produced by
@@ -279,10 +357,18 @@ The correctness rationale is that equal keys have identical future LR behavior,
 the same legal CPCT+ continuation controls, and identical deterministic
 delimiter-state updates. Therefore every continuation available to a
 higher-cost variant is also available to the lower-cost variant at the same
-incremental cost. A strictly more expensive variant cannot contribute a
-minimum-cost repair; an equal-cost history can, and is never removed. Tests
-compare minimum costs and complete reported minimum-cost repair sets with
-dominance OFF and ON.
+incremental cost. The accumulated cost is maintained separately by the
+CPCT+ cost bucket and is not part of the key; search transitions add the
+existing non-negative token costs. A strictly more expensive variant cannot
+contribute a minimum-cost repair; an equal-cost history can, and is never
+removed. This guarantee relies on future CPCT+ transitions depending on the LR
+stack, input index, the two represented continuation controls, the fixed parser
+configuration, and the complete delimiter state—not semantic values or repair
+history beyond those controls. Tests compare costs and complete repair sets
+returned by the existing continuation filter across all four modes when no
+search times out. Selection among equal-ranked repairs may vary because tie
+ordering is unspecified; timeout results are partial and not covered by the
+exhaustive-equivalence claim.
 
 `RecoveryStats` adds `dominance_candidates_checked`,
 `dominance_exact_key_matches`, `dominance_variants_discarded`, and
