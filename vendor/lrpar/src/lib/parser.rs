@@ -102,7 +102,7 @@ pub(super) enum DelimiterKind {
 }
 
 impl DelimiterKind {
-    fn from_open(delimiter: char) -> Option<Self> {
+    pub(super) fn from_open(delimiter: char) -> Option<Self> {
         match delimiter {
             '(' => Some(Self::Parenthesis),
             '{' => Some(Self::Brace),
@@ -111,12 +111,28 @@ impl DelimiterKind {
         }
     }
 
-    fn from_close(delimiter: char) -> Option<Self> {
+    pub(super) fn from_close(delimiter: char) -> Option<Self> {
         match delimiter {
             ')' => Some(Self::Parenthesis),
             '}' => Some(Self::Brace),
             ']' => Some(Self::Bracket),
             _ => None,
+        }
+    }
+
+    pub(super) fn open_char(self) -> char {
+        match self {
+            Self::Parenthesis => '(',
+            Self::Brace => '{',
+            Self::Bracket => '[',
+        }
+    }
+
+    pub(super) fn close_char(self) -> char {
+        match self {
+            Self::Parenthesis => ')',
+            Self::Brace => '}',
+            Self::Bracket => ']',
         }
     }
 }
@@ -767,9 +783,15 @@ where
                 Action::Error => {
                     if recoverer.is_none() {
                         recoverer = Some(match self.rcvry_kind {
-                            RecoveryKind::CPCTPlus => cpctplus::recoverer(self, false),
+                            RecoveryKind::CPCTPlus => cpctplus::recoverer(self, false, false),
                             RecoveryKind::CPCTPlusDelimiterDominance => {
-                                cpctplus::recoverer(self, true)
+                                cpctplus::recoverer(self, true, false)
+                            }
+                            RecoveryKind::CPCTPlusDelimiterLocalization => {
+                                cpctplus::recoverer(self, false, true)
+                            }
+                            RecoveryKind::CPCTPlusDelimiterDominanceAndLocalization => {
+                                cpctplus::recoverer(self, true, true)
                             }
                             RecoveryKind::None => {
                                 let la_lexeme = self.next_lexeme(laidx);
@@ -1095,6 +1117,38 @@ pub struct RecoveryStats {
     pub dominance_discarded_cost_difference: u64,
     /// Whether strict-cost delimiter-aware dominance was enabled for this recovery attempt.
     pub delimiter_dominance_enabled: bool,
+    /// Whether delimiter-origin localization influenced CPCT+ frontier exploration.
+    pub delimiter_localization_enabled: bool,
+    /// Structural event associated with the selected localization target.
+    pub localization_target: Option<String>,
+    /// Opening checkpoint id, when the selected target is an opening delimiter.
+    pub localization_checkpoint_id: Option<usize>,
+    /// Delimiter character associated with the selected localization target.
+    pub localization_delimiter: Option<char>,
+    /// Input token index for the selected origin or unexpected closing event.
+    pub localization_origin_input_index: Option<usize>,
+    /// Byte offset for the selected origin or unexpected closing event.
+    pub localization_origin_byte_index: Option<usize>,
+    /// Character index for the selected origin or unexpected closing event.
+    pub localization_origin_char_index: Option<usize>,
+    /// Nesting depth of the selected target.
+    pub localization_origin_depth: Option<usize>,
+    /// Input token index where CPCT+ actually began recovery.
+    pub recovery_start_input_index: Option<usize>,
+    /// Byte offset where CPCT+ actually began recovery.
+    pub recovery_start_byte_index: Option<usize>,
+    /// Absolute byte distance between the selected origin/event and recovery start.
+    pub localization_to_recovery_start_distance: Option<usize>,
+    /// Byte offset of the final operation in the selected repair sequence.
+    pub final_repair_byte_index: Option<usize>,
+    /// Absolute byte distance from the selected origin/event to the final repair.
+    pub localization_to_repair_distance: Option<usize>,
+    /// Absolute byte distance between the recovery start and final repair operation.
+    pub recovery_start_to_repair_distance: Option<usize>,
+    /// Popped configurations prioritized because they resolved the selected target.
+    pub localization_priority_pops: u64,
+    /// Pops whose localization priority changed the legacy LIFO order within a cost bucket.
+    pub localization_priority_reorders: u64,
     /// Candidate insertion transitions attempted (one per non-EOF terminal considered).
     pub insert_transitions_attempted: u64,
     /// Delete transition calls, including calls at EOF where no transition can be emitted.
@@ -1132,6 +1186,10 @@ pub enum RecoveryKind {
     /// Experimental CPCT+ with strict-cost dominance over identical parser, continuation, and
     /// complete delimiter states. Equal-cost histories are retained.
     CPCTPlusDelimiterDominance,
+    /// CPCT+ with delimiter-origin prioritization inside equal-cost frontier buckets.
+    CPCTPlusDelimiterLocalization,
+    /// CPCT+ with both delimiter localization and strict-cost delimiter-aware dominance.
+    CPCTPlusDelimiterDominanceAndLocalization,
     /// Don't use error recovery: return as soon as the first syntax error is encountered.
     None,
 }
@@ -1153,6 +1211,21 @@ impl TryFrom<RecoveryKind> for Value<Location> {
                 namespace: Some(("RecoveryKind".to_string(), from_loc.clone())),
                 member: ("CPCTPlusDelimiterDominance".to_string(), from_loc.clone()),
             })),
+            RecoveryKind::CPCTPlusDelimiterLocalization => {
+                Value::Setting(Setting::Unitary(Namespaced {
+                    namespace: Some(("RecoveryKind".to_string(), from_loc.clone())),
+                    member: ("CPCTPlusDelimiterLocalization".to_string(), from_loc.clone()),
+                }))
+            }
+            RecoveryKind::CPCTPlusDelimiterDominanceAndLocalization => {
+                Value::Setting(Setting::Unitary(Namespaced {
+                    namespace: Some(("RecoveryKind".to_string(), from_loc.clone())),
+                    member: (
+                        "CPCTPlusDelimiterDominanceAndLocalization".to_string(),
+                        from_loc.clone(),
+                    ),
+                }))
+            }
             RecoveryKind::None => Value::Setting(Setting::Unitary(Namespaced {
                 namespace: Some(("RecoveryKind".to_string(), from_loc.clone())),
                 member: ("None".to_string(), from_loc.clone()),
@@ -1188,6 +1261,12 @@ impl TryFrom<&Value<Location>> for RecoveryKind {
                     "cpctplusdelimiterdominance" => {
                         Ok(RecoveryKind::CPCTPlusDelimiterDominance)
                     }
+                    "cpctplusdelimiterlocalization" => {
+                        Ok(RecoveryKind::CPCTPlusDelimiterLocalization)
+                    }
+                    "cpctplusdelimiterdominanceandlocalization" => {
+                        Ok(RecoveryKind::CPCTPlusDelimiterDominanceAndLocalization)
+                    }
                     "none" => Ok(RecoveryKind::None),
                     _ => Err(HeaderError {
                         kind: HeaderErrorKind::ConversionError("RecoveryKind", "Unknown variant"),
@@ -1212,6 +1291,12 @@ impl quote::ToTokens for RecoveryKind {
             RecoveryKind::CPCTPlus => quote!(::lrpar::RecoveryKind::CPCTPlus),
             RecoveryKind::CPCTPlusDelimiterDominance => {
                 quote!(::lrpar::RecoveryKind::CPCTPlusDelimiterDominance)
+            }
+            RecoveryKind::CPCTPlusDelimiterLocalization => {
+                quote!(::lrpar::RecoveryKind::CPCTPlusDelimiterLocalization)
+            }
+            RecoveryKind::CPCTPlusDelimiterDominanceAndLocalization => {
+                quote!(::lrpar::RecoveryKind::CPCTPlusDelimiterDominanceAndLocalization)
             }
             RecoveryKind::None => quote!(::lrpar::RecoveryKind::None),
         })

@@ -20,8 +20,8 @@ use super::{
     Lexeme, LexerTypes,
     dijkstra::dijkstra,
     parser::{
-        AStackType, DelimiterOrigin, DelimiterOriginKind, DelimiterScoreContext, DelimiterState,
-        ParseRepair, Parser, Recoverer, RecoveryStats,
+        AStackType, DelimiterFrame, DelimiterKind, DelimiterOrigin, DelimiterOriginKind,
+        DelimiterScoreContext, DelimiterState, ParseRepair, Parser, Recoverer, RecoveryStats,
         delimiter_char_from_terminal_name,
     },
 };
@@ -159,6 +159,242 @@ where
     delimiter_state: DelimiterState,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum LocalizationTarget {
+    Opening {
+        frame: DelimiterFrame,
+        checkpoint_id: usize,
+        reason: &'static str,
+        initial_matches: u64,
+        initial_mismatches: u64,
+    },
+    UnexpectedClosing {
+        input_index: usize,
+        byte_index: usize,
+        char_index: usize,
+        kind: DelimiterKind,
+        initial_unexpected: u64,
+        initial_mismatches: u64,
+    },
+}
+
+impl LocalizationTarget {
+    fn priority<StorageT: PrimInt + Unsigned>(
+        self,
+        node: &PathFNode<StorageT>,
+    ) -> i64 {
+        let resolved = node.variants.iter().any(|variant| match self {
+            Self::Opening {
+                frame,
+                initial_matches,
+                initial_mismatches,
+                ..
+            } => {
+                !variant.delimiter_state.stack.contains(&frame)
+                    && variant.delimiter_state.matched_delimiters > initial_matches
+                    && variant.delimiter_state.mismatched_closings == initial_mismatches
+            }
+            Self::UnexpectedClosing {
+                input_index,
+                initial_unexpected,
+                initial_mismatches,
+                ..
+            } => {
+                node.laidx > input_index
+                    && variant.delimiter_state.unexpected_closings == initial_unexpected
+                    && variant.delimiter_state.mismatched_closings == initial_mismatches
+            }
+        });
+        i64::from(resolved)
+    }
+
+    fn record(self, stats: &mut RecoveryStats) {
+        match self {
+            Self::Opening {
+                frame,
+                checkpoint_id,
+                reason,
+                ..
+            } => {
+                stats.localization_target = Some(reason.to_string());
+                stats.localization_checkpoint_id = Some(checkpoint_id);
+                stats.localization_delimiter = Some(frame.kind.open_char());
+                stats.localization_origin_input_index = Some(frame.input_index);
+                stats.localization_origin_byte_index = Some(frame.byte_index);
+                stats.localization_origin_char_index = Some(frame.char_index);
+                stats.localization_origin_depth = Some(frame.depth);
+            }
+            Self::UnexpectedClosing {
+                input_index,
+                byte_index,
+                char_index,
+                kind,
+                ..
+            } => {
+                stats.localization_target = Some("unexpected_closing".to_string());
+                stats.localization_delimiter = Some(kind.close_char());
+                stats.localization_origin_input_index = Some(input_index);
+                stats.localization_origin_byte_index = Some(byte_index);
+                stats.localization_origin_char_index = Some(char_index);
+                stats.localization_origin_depth = Some(0);
+            }
+        }
+    }
+}
+
+fn select_localization_target<
+    'a,
+    'b: 'a,
+    'input: 'b,
+    StorageT: 'static + Debug + Eq + Hash + PrimInt + Unsigned,
+    LexerTypesT: LexerTypes<StorageT = StorageT>,
+    ActionT: 'a,
+    ParamT: Clone,
+>(
+    parser: &Parser<'a, 'b, 'input, StorageT, LexerTypesT, ActionT, ParamT>,
+    input_index: usize,
+    state: &DelimiterState,
+) -> Option<LocalizationTarget>
+where
+    usize: AsPrimitive<StorageT>,
+{
+    let lookahead = parser.next_lexeme(input_index);
+    let error_delimiter = parser.delimiter_for_lexeme(&lookahead);
+    if let Some(closing_kind) = error_delimiter.and_then(DelimiterKind::from_close) {
+        match state.stack.last().copied() {
+            Some(frame)
+                if frame.kind != closing_kind
+                    && matches!(frame.origin_kind, DelimiterOriginKind::Real) =>
+            {
+                return Some(LocalizationTarget::Opening {
+                    checkpoint_id: delimiter_checkpoint_id(parser, frame.input_index),
+                    frame,
+                    reason: "mismatched_closing_opening",
+                    initial_matches: state.matched_delimiters,
+                    initial_mismatches: state.mismatched_closings,
+                });
+            }
+            None => {
+                return Some(LocalizationTarget::UnexpectedClosing {
+                    input_index,
+                    byte_index: lookahead.span().start(),
+                    char_index: parser.delimiter_char_index(lookahead.span().start()),
+                    kind: closing_kind,
+                    initial_unexpected: state.unexpected_closings,
+                    initial_mismatches: state.mismatched_closings,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    let mut future_stack = state.stack.clone();
+    let mut future_mismatch = None;
+    let mut future_unexpected = None;
+    for future_index in input_index..parser.lexemes.len() {
+        let lexeme = parser.next_lexeme(future_index);
+        match parser
+            .delimiter_for_lexeme(&lexeme)
+            .and_then(|delimiter| {
+                DelimiterKind::from_open(delimiter)
+                    .map(|kind| (kind, true))
+                    .or_else(|| DelimiterKind::from_close(delimiter).map(|kind| (kind, false)))
+            }) {
+            Some((kind, true)) => {
+                let byte_index = lexeme.span().start();
+                future_stack.push(DelimiterFrame {
+                    kind,
+                    input_index: future_index,
+                    char_index: parser.delimiter_char_index(byte_index),
+                    byte_index,
+                    depth: future_stack.len() + 1,
+                    origin_kind: DelimiterOriginKind::Real,
+                });
+            }
+            Some((closing_kind, false)) => {
+                match future_stack.pop() {
+                    Some(opening) if opening.kind != closing_kind => {
+                        if future_mismatch.is_none()
+                            && matches!(opening.origin_kind, DelimiterOriginKind::Real)
+                        {
+                            future_mismatch = Some(opening);
+                        }
+                    }
+                    None if future_unexpected.is_none() => {
+                        let byte_index = lexeme.span().start();
+                        future_unexpected = Some(LocalizationTarget::UnexpectedClosing {
+                            input_index: future_index,
+                            byte_index,
+                            char_index: parser.delimiter_char_index(byte_index),
+                            kind: closing_kind,
+                            initial_unexpected: state.unexpected_closings,
+                            initial_mismatches: state.mismatched_closings,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            None => {}
+        }
+    }
+
+    if let Some(frame) = future_mismatch {
+        return Some(LocalizationTarget::Opening {
+            checkpoint_id: delimiter_checkpoint_id(parser, frame.input_index),
+            frame,
+            reason: "mismatched_closing_opening",
+            initial_matches: state.matched_delimiters,
+            initial_mismatches: state.mismatched_closings,
+        });
+    }
+    if future_unexpected.is_some() {
+        return future_unexpected;
+    }
+
+    state
+        .stack
+        .iter()
+        .rev()
+        .find(|frame| {
+            matches!(frame.origin_kind, DelimiterOriginKind::Real)
+                && future_stack.contains(frame)
+        })
+        .copied()
+        .map(|frame| LocalizationTarget::Opening {
+            checkpoint_id: delimiter_checkpoint_id(parser, frame.input_index),
+            frame,
+            reason: "unmatched_opening",
+            initial_matches: state.matched_delimiters,
+            initial_mismatches: state.mismatched_closings,
+        })
+}
+
+fn delimiter_checkpoint_id<
+    'a,
+    'b: 'a,
+    'input: 'b,
+    StorageT: 'static + Debug + Eq + Hash + PrimInt + Unsigned,
+    LexerTypesT: LexerTypes<StorageT = StorageT>,
+    ActionT: 'a,
+    ParamT: Clone,
+>(
+    parser: &Parser<'a, 'b, 'input, StorageT, LexerTypesT, ActionT, ParamT>,
+    input_index: usize,
+) -> usize
+where
+    usize: AsPrimitive<StorageT>,
+{
+    (0..=input_index.min(parser.lexemes.len().saturating_sub(1)))
+        .filter(|index| {
+            parser
+                .delimiter_for_lexeme(&parser.next_lexeme(*index))
+                .and_then(DelimiterKind::from_open)
+                .is_some()
+        })
+        .count()
+        .saturating_sub(1)
+}
+
 impl<StorageT: PrimInt + Unsigned> PathFNode<StorageT> {
     fn last_repair(&self) -> Option<Repair<StorageT>> {
         self.variants.first().and_then(RepairVariant::last_repair)
@@ -224,6 +460,7 @@ struct CPCTPlus<
 {
     parser: &'a Parser<'a, 'b, 'input, StorageT, LexerTypesT, ActionT, ParamT>,
     delimiter_dominance: bool,
+    delimiter_localization: bool,
 }
 
 pub(super) fn recoverer<
@@ -235,6 +472,7 @@ pub(super) fn recoverer<
 >(
     parser: &'a Parser<StorageT, LexerTypesT, ActionT, ParamT>,
     delimiter_dominance: bool,
+    delimiter_localization: bool,
 ) -> Box<dyn Recoverer<StorageT, LexerTypesT, ActionT, ParamT> + 'a>
 where
     usize: AsPrimitive<StorageT>,
@@ -242,6 +480,7 @@ where
     Box::new(CPCTPlus {
         parser,
         delimiter_dominance,
+        delimiter_localization,
     })
 }
 
@@ -276,6 +515,21 @@ where
         let started = Instant::now();
         let mut stats = RecoveryStats::default();
         stats.delimiter_dominance_enabled = self.delimiter_dominance;
+        stats.delimiter_localization_enabled = self.delimiter_localization;
+        stats.recovery_start_input_index = Some(in_laidx);
+        stats.recovery_start_byte_index =
+            Some(parser.next_lexeme(in_laidx).span().start());
+        let localization_target = self
+            .delimiter_localization
+            .then(|| select_localization_target(parser, in_laidx, delimiter_state))
+            .flatten();
+        if let Some(target) = localization_target {
+            target.record(&mut stats);
+        }
+        stats.localization_to_recovery_start_distance = stats
+            .localization_origin_byte_index
+            .zip(stats.recovery_start_byte_index)
+            .map(|(origin, start)| origin.abs_diff(start));
         let error_delimiter = parser.delimiter_for_lexeme(&parser.next_lexeme(in_laidx));
         let delimiter_score_context = DelimiterScoreContext::new(delimiter_state, error_delimiter);
         // This function implements a minor variant of the algorithm from "Repairing syntax errors
@@ -372,6 +626,12 @@ where
                     .max()
                     .unwrap_or_default()
             },
+            localization_target.is_some(),
+            |n| {
+                localization_target
+                    .map(|target| target.priority(n))
+                    .unwrap_or_default()
+            },
             |n, cost, stats| {
                 if self.delimiter_dominance {
                     retain_nondominated_variants(n, cost, &mut dominance_index, stats)
@@ -409,6 +669,16 @@ where
         let recovered_delimiter_state = rnk_rprs[0].delimiter_state.clone();
         stats.selected_repair_delimiter_score =
             Some(delimiter_score_context.score(&recovered_delimiter_state));
+        stats.final_repair_byte_index =
+            final_repair_byte_index(parser, in_laidx, &rnk_rprs[0].repairs);
+        stats.localization_to_repair_distance = stats
+            .localization_origin_byte_index
+            .zip(stats.final_repair_byte_index)
+            .map(|(origin, repair)| origin.abs_diff(repair));
+        stats.recovery_start_to_repair_distance = stats
+            .recovery_start_byte_index
+            .zip(stats.final_repair_byte_index)
+            .map(|(start, repair)| start.abs_diff(repair));
         let laidx = apply_repairs(
             parser,
             in_laidx,
@@ -739,6 +1009,37 @@ where
         );
     }
     state
+}
+
+fn final_repair_byte_index<
+    'a,
+    'b: 'a,
+    'input: 'b,
+    StorageT: 'static + Debug + Eq + Hash + PrimInt + Unsigned,
+    LexerTypesT: LexerTypes<StorageT = StorageT>,
+    ActionT: 'a,
+    ParamT: Clone,
+>(
+    parser: &Parser<'a, 'b, 'input, StorageT, LexerTypesT, ActionT, ParamT>,
+    mut input_index: usize,
+    repairs: &[ParseRepair<LexerTypesT::LexemeT, StorageT>],
+) -> Option<usize>
+where
+    usize: AsPrimitive<StorageT>,
+{
+    let mut final_position = None;
+    for repair in repairs {
+        match repair {
+            ParseRepair::Insert(_) => {
+                final_position = Some(parser.next_lexeme(input_index).span().start());
+            }
+            ParseRepair::Delete(lexeme) | ParseRepair::Shift(lexeme) => {
+                final_position = Some(lexeme.span().start());
+                input_index += 1;
+            }
+        }
+    }
+    final_position
 }
 
 fn apply_delimiter_repairs<
@@ -1618,5 +1919,30 @@ E: E '+' E
         let equal_cost_alternatives =
             recovery_signature(RecoveryKind::CPCTPlusDelimiterDominance, "1+*");
         assert_eq!(equal_cost_alternatives.0[0].len(), 2);
+    }
+
+    #[test]
+    fn delimiter_localization_prioritizes_equal_cost_configs_without_changing_repairs() {
+        for input in ["(1+2", "1+2)"] {
+            let baseline = recovery_signature(RecoveryKind::CPCTPlus, input);
+            let localized =
+                recovery_signature(RecoveryKind::CPCTPlusDelimiterLocalization, input);
+            assert_eq!(localized.0, baseline.0, "repair set changed for {input}");
+            assert_eq!(localized.1, baseline.1, "minimum cost changed for {input}");
+            assert!(localized.2.iter().all(|stats| {
+                stats.delimiter_localization_enabled
+                    && stats.localization_target.is_some()
+                    && stats.recovery_start_byte_index.is_some()
+                    && stats.final_repair_byte_index.is_some()
+            }));
+        }
+
+        let unrelated = recovery_signature(RecoveryKind::CPCTPlusDelimiterLocalization, "1+*");
+        assert!(unrelated.2.iter().all(|stats| {
+            stats.delimiter_localization_enabled
+                && stats.localization_target.is_none()
+                && stats.localization_priority_pops == 0
+                && stats.localization_priority_reorders == 0
+        }));
     }
 }

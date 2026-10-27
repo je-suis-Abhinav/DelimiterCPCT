@@ -2128,6 +2128,8 @@ A : 'a';"
                 (Some(RK::None),      None,               Some(RK::None)),
                 (Some(RK::CPCTPlus),  None,               Some(RK::CPCTPlus)),
                 (None, Some(RK::CPCTPlusDelimiterDominance), Some(RK::CPCTPlusDelimiterDominance)),
+                (None, Some(RK::CPCTPlusDelimiterLocalization), Some(RK::CPCTPlusDelimiterLocalization)),
+                (None, Some(RK::CPCTPlusDelimiterDominanceAndLocalization), Some(RK::CPCTPlusDelimiterDominanceAndLocalization)),
             ];
 
         for (i, (builder_arg, header_arg, expected_rk)) in
@@ -2145,6 +2147,12 @@ A : 'a';"
                         RK::CPCTPlus => "RecoveryKind::CPCTPlus",
                         RK::CPCTPlusDelimiterDominance => {
                             "RecoveryKind::CPCTPlusDelimiterDominance"
+                        }
+                        RK::CPCTPlusDelimiterLocalization => {
+                            "RecoveryKind::CPCTPlusDelimiterLocalization"
+                        }
+                        RK::CPCTPlusDelimiterDominanceAndLocalization => {
+                            "RecoveryKind::CPCTPlusDelimiterDominanceAndLocalization"
                         }
                     }
                 )
@@ -2178,6 +2186,14 @@ A : 'a';"
                         | (
                             RK::CPCTPlusDelimiterDominance,
                             Some(RK::CPCTPlusDelimiterDominance)
+                        )
+                        | (
+                            RK::CPCTPlusDelimiterLocalization,
+                            Some(RK::CPCTPlusDelimiterLocalization)
+                        )
+                        | (
+                            RK::CPCTPlusDelimiterDominanceAndLocalization,
+                            Some(RK::CPCTPlusDelimiterDominanceAndLocalization)
                         )
                 ) {
                     Ok(())
