@@ -8,6 +8,8 @@ use lrpar::Lexer;
 
 const DEFAULT_TRIALS: usize = 5;
 const DEFAULT_WARMUPS: usize = 1;
+pub const PHASE6_DEFAULT_TRIALS: usize = 15;
+pub const PHASE6_DEFAULT_WARMUPS: usize = 3;
 const MODE_LABELS: [(&str, &str, bool, bool); 4] = [
     ("OFF", "OFF", false, false),
     ("ON", "OFF", true, false),
@@ -103,6 +105,9 @@ const SUMMARY_COLUMNS: &[&str] = &[
     "search_work_effect",
     "runtime_effect",
 ];
+const PHASE6_RAW_EXTRA_COLUMN: &str = "differential_comparison";
+const PHASE6_SUMMARY_EXTRA_COLUMNS: &[&str] =
+    &["equivalence_checked_trials", "incomplete_comparison_trials"];
 
 #[derive(Clone, Debug)]
 struct CorpusCase {
@@ -200,6 +205,111 @@ fn corpus() -> Vec<CorpusCase> {
     cases
 }
 
+fn phase6_corpus() -> Vec<CorpusCase> {
+    let mut cases = Vec::new();
+    for depth in [64, 128, 256] {
+        cases.push(CorpusCase {
+            name: format!("phase6_valid_nesting_depth_{depth}"),
+            category: "phase6_valid_nesting",
+            input: format!("{}1+2{}", "(".repeat(depth), ")".repeat(depth)),
+            expects_recovery: false,
+        });
+    }
+    for depth in [8, 16, 32, 64] {
+        cases.push(CorpusCase {
+            name: format!("phase6_missing_close_depth_{depth}"),
+            category: "phase6_missing_close_nesting",
+            input: format!("{}1+2", "(".repeat(depth)),
+            expects_recovery: true,
+        });
+    }
+    for terms in [48, 96, 192] {
+        let expression = expression_with_terms(terms);
+        cases.push(CorpusCase {
+            name: format!("phase6_valid_expression_terms_{terms}"),
+            category: "phase6_valid_expression_size",
+            input: expression.clone(),
+            expects_recovery: false,
+        });
+        cases.push(CorpusCase {
+            name: format!("phase6_missing_close_expression_terms_{terms}"),
+            category: "phase6_missing_close_expression_size",
+            input: format!("({expression}"),
+            expects_recovery: true,
+        });
+    }
+    cases.extend(
+        [
+            (
+                "phase6_mismatch_outer_close",
+                "phase6_mismatched",
+                "({[1+2)}]",
+            ),
+            (
+                "phase6_mismatch_inner_close",
+                "phase6_mismatched",
+                "(({1+2)]}",
+            ),
+            (
+                "phase6_mismatch_later_position",
+                "phase6_mismatched",
+                "{([1+2]})",
+            ),
+            (
+                "phase6_crossed_paren_bracket",
+                "phase6_crossed_mixed",
+                "([1+{2*3)]}",
+            ),
+            (
+                "phase6_crossed_brace_paren",
+                "phase6_crossed_mixed",
+                "{(1+[2*3})]",
+            ),
+            (
+                "phase6_mixed_unexpected_close",
+                "phase6_crossed_mixed",
+                "1+({2*([3+4)]}",
+            ),
+            (
+                "phase6_multiple_unmatched_three_types",
+                "phase6_multiple_unmatched",
+                "({[1+2",
+            ),
+            (
+                "phase6_multiple_unmatched_mixed_depth",
+                "phase6_multiple_unmatched",
+                "({[({1+2})",
+            ),
+        ]
+        .into_iter()
+        .map(|(name, category, input)| CorpusCase {
+            name: name.to_string(),
+            category,
+            input: input.to_string(),
+            expects_recovery: true,
+        }),
+    );
+    for (name, suffix) in [
+        ("phase6_ordinary_error_long_missing_operand", "+*7"),
+        ("phase6_ordinary_error_long_extra_operator", "++7"),
+    ] {
+        cases.push(CorpusCase {
+            name: name.to_string(),
+            category: "phase6_ordinary_syntax",
+            input: format!("{}{}", expression_with_terms(96), suffix),
+            expects_recovery: true,
+        });
+    }
+    cases
+}
+
+fn expression_with_terms(terms: usize) -> String {
+    (1..=terms)
+        .map(|number| (number % 9 + 1).to_string())
+        .collect::<Vec<_>>()
+        .join("+")
+}
+
 #[derive(Clone)]
 struct TrialRecord {
     case_index: usize,
@@ -221,6 +331,34 @@ struct TrialRecord {
     minimum_costs: String,
     repair_counts: String,
     timeout: bool,
+    differential_status: Option<String>,
+}
+
+#[derive(Clone)]
+struct DifferentialObservation {
+    minimum_costs: Vec<Option<u16>>,
+    repair_sets: Vec<Vec<String>>,
+    timed_out: bool,
+}
+
+impl DifferentialObservation {
+    fn from_report(report: &crate::BaselineRecoveryStatsReport) -> Self {
+        Self {
+            minimum_costs: report
+                .recovery_stats
+                .iter()
+                .map(|stats| stats.minimum_recovery_cost)
+                .collect(),
+            repair_sets: normalized_repair_sets(&report.baseline.errors),
+            timed_out: report.recovery_stats.iter().any(|stats| stats.timed_out),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DifferentialResult {
+    Equivalent,
+    IncompleteTimeout,
 }
 
 /// Run paired measurements in a deterministic, varied mode order.
@@ -233,10 +371,27 @@ pub fn benchmark_tsv() -> String {
 }
 
 pub fn benchmark_tsv_with_trials(trials: usize, warmups: usize) -> Result<String, String> {
+    benchmark_tsv_for_cases(&corpus(), trials, warmups, false)
+}
+
+pub fn benchmark_phase6_tsv_with_trials(trials: usize, warmups: usize) -> Result<String, String> {
+    benchmark_tsv_for_cases(&phase6_corpus(), trials, warmups, true)
+}
+
+pub fn benchmark_phase6_tsv() -> String {
+    benchmark_phase6_tsv_with_trials(PHASE6_DEFAULT_TRIALS, PHASE6_DEFAULT_WARMUPS)
+        .expect("the built-in Phase 6 benchmark settings are valid")
+}
+
+fn benchmark_tsv_for_cases(
+    cases: &[CorpusCase],
+    trials: usize,
+    warmups: usize,
+    compare_modes: bool,
+) -> Result<String, String> {
     if trials == 0 {
         return Err("benchmark trial count must be greater than zero".to_string());
     }
-    let cases = corpus();
     let mut records = Vec::with_capacity(cases.len() * MODE_LABELS.len() * trials);
 
     for (case_index, case) in cases.iter().enumerate() {
@@ -251,12 +406,17 @@ pub fn benchmark_tsv_with_trials(trials: usize, warmups: usize) -> Result<String
             }
         }
         for trial in 0..trials {
+            let mut differential_observations = vec![None; MODE_LABELS.len()];
             for mode_index in mode_order(case_index, trial, false) {
                 let options = mode_options(mode_index);
                 let started = Instant::now();
                 let report = parse_baseline_with_recovery_stats_and_options(&case.input, options);
                 let parse_ns = started.elapsed().as_nanos();
                 validate_case(case, &report.baseline.status, &report.recovery_stats.len())?;
+                if compare_modes {
+                    differential_observations[mode_index] =
+                        Some(DifferentialObservation::from_report(&report));
+                }
                 records.push(make_record(
                     case_index,
                     case,
@@ -270,16 +430,70 @@ pub fn benchmark_tsv_with_trials(trials: usize, warmups: usize) -> Result<String
                     report,
                 ));
             }
+            if compare_modes {
+                let comparison = check_differential_equivalence(case, &differential_observations)?;
+                let status = match comparison {
+                    DifferentialResult::Equivalent => "equivalent",
+                    DifferentialResult::IncompleteTimeout => "incomplete_timeout",
+                };
+                let mut rows_updated = 0;
+                for record in records
+                    .iter_mut()
+                    .filter(|record| record.case_index == case_index && record.trial == trial)
+                {
+                    record.fields.push(status.to_string());
+                    record.differential_status = Some(status.to_string());
+                    rows_updated += 1;
+                }
+                if rows_updated != MODE_LABELS.len() {
+                    return Err(format!(
+                        "Phase 6 case {:?} has an incomplete paired trial",
+                        case.name
+                    ));
+                }
+            }
         }
     }
 
-    let mut output = TSV_COLUMNS.join("\t");
+    records_to_tsv(&records, compare_modes)
+}
+
+fn records_to_tsv(records: &[TrialRecord], phase6: bool) -> Result<String, String> {
+    let mut output = raw_tsv_header(phase6);
     output.push('\n');
-    for record in &records {
+    let mut unique_rows = BTreeSet::new();
+    for record in records {
+        if !unique_rows.insert((record.case_index, record.mode_index, record.trial)) {
+            return Err("benchmark run generated duplicate paired trial rows".to_string());
+        }
+        let expected_len = TSV_COLUMNS.len() + if phase6 { 1 } else { 0 };
+        if record.fields.len() != expected_len {
+            return Err("benchmark run generated a row with an invalid schema".to_string());
+        }
         output.push_str(&record.fields.join("\t"));
         output.push('\n');
     }
     Ok(output)
+}
+
+fn raw_tsv_header(phase6: bool) -> String {
+    if phase6 {
+        format!("{}\t{}", TSV_COLUMNS.join("\t"), PHASE6_RAW_EXTRA_COLUMN)
+    } else {
+        TSV_COLUMNS.join("\t")
+    }
+}
+
+fn summary_tsv_header(phase6: bool) -> String {
+    if phase6 {
+        format!(
+            "{}\t{}",
+            SUMMARY_COLUMNS.join("\t"),
+            PHASE6_SUMMARY_EXTRA_COLUMNS.join("\t")
+        )
+    } else {
+        SUMMARY_COLUMNS.join("\t")
+    }
 }
 
 pub fn benchmark_summary_tsv() -> String {
@@ -293,12 +507,36 @@ pub fn benchmark_summary_tsv_with_trials(trials: usize, warmups: usize) -> Resul
 }
 
 pub fn benchmark_summary_from_tsv(raw: &str) -> Result<String, String> {
+    benchmark_summary_for_tsv(raw, &corpus(), false)
+}
+
+pub fn benchmark_phase6_summary_from_tsv(raw: &str) -> Result<String, String> {
+    benchmark_summary_for_tsv(raw, &phase6_corpus(), true)
+}
+
+pub fn benchmark_phase6_summary_tsv_with_trials(
+    trials: usize,
+    warmups: usize,
+) -> Result<String, String> {
+    let raw = benchmark_phase6_tsv_with_trials(trials, warmups)?;
+    benchmark_phase6_summary_from_tsv(&raw)
+}
+
+fn benchmark_summary_for_tsv(
+    raw: &str,
+    cases: &[CorpusCase],
+    phase6: bool,
+) -> Result<String, String> {
+    if raw.lines().next() != Some(raw_tsv_header(phase6).as_str()) {
+        return Err("benchmark TSV header did not match the expected schema".to_string());
+    }
     let first_row = raw
         .lines()
         .nth(1)
         .ok_or_else(|| "benchmark TSV contains no measured rows".to_string())?;
     let metadata = first_row.split('\t').collect::<Vec<_>>();
-    if metadata.len() != TSV_COLUMNS.len() {
+    let expected_columns = TSV_COLUMNS.len() + usize::from(phase6);
+    if metadata.len() != expected_columns {
         return Err("benchmark TSV row has an unexpected number of columns".to_string());
     }
     let trials = metadata[4]
@@ -310,8 +548,8 @@ pub fn benchmark_summary_from_tsv(raw: &str) -> Result<String, String> {
     if trials == 0 {
         return Err("benchmark TSV must contain at least one measured trial".to_string());
     }
-    let mut records = parse_raw_records(raw)?;
-    let expected_rows = corpus().len() * MODE_LABELS.len() * trials;
+    let mut records = parse_raw_records(raw, cases, phase6)?;
+    let expected_rows = cases.len() * MODE_LABELS.len() * trials;
     let unique_rows = records
         .iter()
         .map(|record| (record.case_index, record.mode_index, record.trial))
@@ -319,16 +557,51 @@ pub fn benchmark_summary_from_tsv(raw: &str) -> Result<String, String> {
     if records.len() != expected_rows || unique_rows.len() != expected_rows {
         return Err("benchmark TSV is missing or duplicates paired trial rows".to_string());
     }
+    if phase6 {
+        validate_phase6_comparison_metadata(&records)?;
+    }
     if records.iter().any(|record| {
         record.fields[4] != trials.to_string()
             || record.fields[5] != warmups.to_string()
             || record.trial >= trials
             || record.fields[8] != metadata[8]
             || record.fields[47] != metadata[47]
+            || (phase6 && record.fields[48].is_empty())
     }) {
         return Err("benchmark TSV has inconsistent trial or build metadata".to_string());
     }
-    summarize_records(&mut records, trials, warmups)
+    summarize_records(&mut records, trials, warmups, cases, phase6)
+}
+
+fn validate_phase6_comparison_metadata(records: &[TrialRecord]) -> Result<(), String> {
+    let mut pairs = std::collections::BTreeMap::<(usize, usize), Vec<&TrialRecord>>::new();
+    for record in records {
+        pairs
+            .entry((record.case_index, record.trial))
+            .or_default()
+            .push(record);
+    }
+    for rows in pairs.values() {
+        if rows.len() != MODE_LABELS.len() {
+            return Err("Phase 6 TSV has an incomplete mode pair".to_string());
+        }
+        let timed_out = rows.iter().any(|record| record.timeout);
+        let expected_status = if timed_out {
+            "incomplete_timeout"
+        } else {
+            "equivalent"
+        };
+        if rows
+            .iter()
+            .any(|record| record.differential_status.as_deref() != Some(expected_status))
+        {
+            return Err(
+                "Phase 6 TSV differential status conflicts with its timeout observations"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(())
 }
 
 fn validate_case(
@@ -352,6 +625,77 @@ fn validate_case(
         ));
     }
     Ok(())
+}
+
+fn check_differential_equivalence(
+    case: &CorpusCase,
+    observations: &[Option<DifferentialObservation>],
+) -> Result<DifferentialResult, String> {
+    let observations = observations
+        .iter()
+        .enumerate()
+        .map(|(index, observation)| {
+            observation.as_ref().ok_or_else(|| {
+                format!(
+                    "Phase 6 case {:?} is missing mode {} for differential validation",
+                    case.name, index
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if observations.iter().any(|observation| observation.timed_out) {
+        return Ok(DifferentialResult::IncompleteTimeout);
+    }
+
+    let baseline = observations[0];
+    if case.expects_recovery
+        && observations.iter().any(|observation| {
+            observation.minimum_costs.is_empty()
+                || observation.minimum_costs.iter().any(Option::is_none)
+                || observation.repair_sets.is_empty()
+                || observation.repair_sets.iter().any(Vec::is_empty)
+        })
+    {
+        return Err(format!(
+            "completed Phase 6 case {:?} is missing minimum-cost repair data",
+            case.name
+        ));
+    }
+    for (mode_index, observation) in observations.iter().enumerate().skip(1) {
+        if observation.minimum_costs != baseline.minimum_costs {
+            return Err(format!(
+                "Phase 6 case {:?} has a minimum recovery cost discrepancy in mode {}",
+                case.name, mode_index
+            ));
+        }
+        if observation.repair_sets != baseline.repair_sets {
+            return Err(format!(
+                "Phase 6 case {:?} has a minimum-cost repair-set discrepancy in mode {}",
+                case.name, mode_index
+            ));
+        }
+    }
+    Ok(DifferentialResult::Equivalent)
+}
+
+fn normalized_repair_sets(errors: &[String]) -> Vec<Vec<String>> {
+    let mut repair_sets = errors
+        .iter()
+        .map(|error| {
+            let Some((_, repairs)) = error.split_once("Repair sequences found:\n") else {
+                return Vec::new();
+            };
+            let mut repairs = repairs
+                .lines()
+                .filter_map(|line| line.trim().split_once(": ").map(|(_, repair)| repair))
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            repairs.sort();
+            repairs
+        })
+        .collect::<Vec<_>>();
+    repair_sets.sort();
+    repair_sets
 }
 
 fn mode_options(mode_index: usize) -> RecoveryOptions {
@@ -556,6 +900,7 @@ fn make_record(
         minimum_costs: min_costs,
         repair_counts,
         timeout,
+        differential_status: None,
     }
 }
 
@@ -589,9 +934,10 @@ fn summarize_records(
     records: &mut [TrialRecord],
     trials: usize,
     warmups: usize,
+    cases: &[CorpusCase],
+    phase6: bool,
 ) -> Result<String, String> {
-    let cases = corpus();
-    let mut output = SUMMARY_COLUMNS.join("\t");
+    let mut output = summary_tsv_header(phase6);
     output.push('\n');
     for case_index in 0..cases.len() {
         for mode_index in 0..MODE_LABELS.len() {
@@ -607,6 +953,7 @@ fn summarize_records(
                 case_index,
                 trials,
                 warmups,
+                phase6,
             )?);
             output.push('\n');
         }
@@ -638,6 +985,7 @@ fn summarize_records(
             usize::MAX,
             trials,
             warmups,
+            phase6,
         )?);
         output.push('\n');
     }
@@ -702,6 +1050,19 @@ fn aggregate_record(mode_index: usize, trial: usize, selected: &[&TrialRecord]) 
         minimum_costs: costs,
         repair_counts: repairs,
         timeout: selected.iter().any(|record| record.timeout),
+        differential_status: if selected
+            .iter()
+            .any(|record| record.differential_status.as_deref() == Some("incomplete_timeout"))
+        {
+            Some("incomplete_timeout".to_string())
+        } else if selected
+            .iter()
+            .all(|record| record.differential_status.as_deref() == Some("equivalent"))
+        {
+            Some("equivalent".to_string())
+        } else {
+            None
+        },
     }
 }
 
@@ -714,6 +1075,7 @@ fn summary_row(
     case_index: usize,
     trials: usize,
     warmups: usize,
+    phase6: bool,
 ) -> Result<String, String> {
     if group.len() != trials {
         return Err(format!("incomplete trial group for {case_name}"));
@@ -767,7 +1129,7 @@ fn summary_row(
     let costs = unique_join(group.iter().map(|record| record.minimum_costs.as_str()));
     let repairs = unique_join(group.iter().map(|record| record.repair_counts.as_str()));
 
-    let fields = vec![
+    let mut fields = vec![
         tsv_field(case_name),
         dominance.to_string(),
         localization.to_string(),
@@ -834,20 +1196,42 @@ fn summary_row(
         search_effect,
         runtime_effect,
     ];
-    debug_assert_eq!(fields.len(), SUMMARY_COLUMNS.len());
+    if phase6 {
+        let equivalent_trials = group
+            .iter()
+            .filter(|record| record.differential_status.as_deref() == Some("equivalent"))
+            .count();
+        let incomplete_trials = group
+            .iter()
+            .filter(|record| record.differential_status.as_deref() == Some("incomplete_timeout"))
+            .count();
+        fields.extend([equivalent_trials.to_string(), incomplete_trials.to_string()]);
+    }
+    debug_assert_eq!(
+        fields.len(),
+        SUMMARY_COLUMNS.len()
+            + if phase6 {
+                PHASE6_SUMMARY_EXTRA_COLUMNS.len()
+            } else {
+                0
+            }
+    );
     Ok(fields.join("\t"))
 }
 
-fn parse_raw_records(raw: &str) -> Result<Vec<TrialRecord>, String> {
+fn parse_raw_records(
+    raw: &str,
+    cases: &[CorpusCase],
+    phase6: bool,
+) -> Result<Vec<TrialRecord>, String> {
     let mut lines = raw.lines();
-    if lines.next() != Some(TSV_COLUMNS.join("\t").as_str()) {
+    if lines.next() != Some(raw_tsv_header(phase6).as_str()) {
         return Err("benchmark TSV header did not match the expected schema".to_string());
     }
-    let cases = corpus();
     let mut records = Vec::new();
     for line in lines {
         let fields = line.split('\t').map(str::to_string).collect::<Vec<_>>();
-        if fields.len() != TSV_COLUMNS.len() {
+        if fields.len() != TSV_COLUMNS.len() + if phase6 { 1 } else { 0 } {
             return Err("benchmark TSV row has an unexpected number of columns".to_string());
         }
         let case_index = cases
@@ -863,6 +1247,15 @@ fn parse_raw_records(raw: &str) -> Result<Vec<TrialRecord>, String> {
         let trial = fields[3]
             .parse()
             .map_err(|_| "invalid trial index in benchmark TSV".to_string())?;
+        let differential_status = if phase6 {
+            let status = fields[TSV_COLUMNS.len()].clone();
+            if status != "equivalent" && status != "incomplete_timeout" {
+                return Err("invalid Phase 6 differential status in benchmark TSV".to_string());
+            }
+            Some(status)
+        } else {
+            None
+        };
         records.push(TrialRecord {
             case_index,
             mode_index,
@@ -882,6 +1275,7 @@ fn parse_raw_records(raw: &str) -> Result<Vec<TrialRecord>, String> {
             minimum_costs: fields[31].clone(),
             repair_counts: fields[32].clone(),
             timeout: fields[33] == "true",
+            differential_status,
             fields,
         });
     }
@@ -1035,9 +1429,13 @@ mod tests {
     use crate::{BaselineStatus, RecoveryOptions, parse_baseline_with_recovery_stats_and_options};
 
     use super::{
-        MODE_LABELS, SUMMARY_COLUMNS, TSV_COLUMNS, benchmark_summary_from_tsv,
-        benchmark_tsv_with_trials, change_percent, compare_effect, corpus, mean, median,
-        mode_options, mode_order, reduction_percent, stddev,
+        CorpusCase, DifferentialObservation, DifferentialResult, MODE_LABELS,
+        PHASE6_DEFAULT_TRIALS, PHASE6_DEFAULT_WARMUPS, SUMMARY_COLUMNS, TSV_COLUMNS,
+        benchmark_phase6_summary_from_tsv, benchmark_phase6_tsv_with_trials,
+        benchmark_summary_from_tsv, benchmark_tsv_with_trials, change_percent,
+        check_differential_equivalence, compare_effect, corpus, input_token_count, mean, median,
+        mode_options, mode_order, normalized_repair_sets, phase6_corpus, raw_tsv_header,
+        reduction_percent, stddev, summary_tsv_header,
     };
 
     #[test]
@@ -1233,24 +1631,162 @@ mod tests {
         assert!(benchmark_tsv_with_trials(0, 1).is_err());
     }
 
-    fn normalized_repair_sets(errors: &[String]) -> Vec<Vec<String>> {
-        let mut repair_sets = errors
+    #[test]
+    fn phase6_corpus_is_lexically_valid_unique_and_scales_as_declared() {
+        assert_eq!(PHASE6_DEFAULT_TRIALS, 15);
+        assert_eq!(PHASE6_DEFAULT_WARMUPS, 3);
+        let cases = phase6_corpus();
+        let names = cases
             .iter()
-            .map(|error| {
-                let Some((_, repairs)) = error.split_once("Repair sequences found:\n") else {
-                    return Vec::new();
-                };
-                let mut repairs = repairs
-                    .lines()
-                    .filter_map(|line| line.trim().split_once(": ").map(|(_, repair)| repair))
-                    .map(str::to_string)
-                    .collect::<Vec<_>>();
-                repairs.sort();
-                repairs
-            })
+            .map(|case| case.name.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(names.len(), cases.len());
+
+        for case in &cases {
+            assert!(
+                input_token_count(&case.input).is_some(),
+                "lexically invalid Phase 6 case {:?}",
+                case.name
+            );
+            assert!(case.name.starts_with("phase6_"));
+        }
+
+        for depth in [64, 128, 256] {
+            let case = cases
+                .iter()
+                .find(|case| case.name == format!("phase6_valid_nesting_depth_{depth}"))
+                .unwrap();
+            assert_eq!(case.input.matches('(').count(), depth);
+            assert_eq!(case.input.matches(')').count(), depth);
+            assert!(!case.expects_recovery);
+        }
+        for depth in [8, 16, 32, 64] {
+            let case = cases
+                .iter()
+                .find(|case| case.name == format!("phase6_missing_close_depth_{depth}"))
+                .unwrap();
+            assert_eq!(case.input.matches('(').count(), depth);
+            assert_eq!(case.input.matches(')').count(), 0);
+            assert!(case.expects_recovery);
+        }
+        for terms in [48, 96, 192] {
+            assert!(cases.iter().any(|case| {
+                case.name == format!("phase6_valid_expression_terms_{terms}")
+                    && !case.expects_recovery
+            }));
+            assert!(cases.iter().any(|case| {
+                case.name == format!("phase6_missing_close_expression_terms_{terms}")
+                    && case.expects_recovery
+            }));
+        }
+        assert!(
+            cases
+                .iter()
+                .all(|case| { case.name.starts_with("phase6_valid_") || case.expects_recovery })
+        );
+    }
+
+    #[test]
+    fn phase6_benchmark_emits_paired_rows_and_round_trips_summary() {
+        let raw = benchmark_phase6_tsv_with_trials(1, 0).unwrap();
+        let lines = raw.lines().collect::<Vec<_>>();
+        assert_eq!(lines[0], raw_tsv_header(true));
+        assert_eq!(lines[1].split('\t').count(), TSV_COLUMNS.len() + 1);
+        let cases = phase6_corpus();
+        assert_eq!(lines.len() - 1, cases.len() * MODE_LABELS.len());
+        for case in &cases {
+            let modes = lines
+                .iter()
+                .skip(1)
+                .filter_map(|row| {
+                    let fields = row.split('\t').collect::<Vec<_>>();
+                    (fields[0] == case.name).then(|| (fields[6], fields[7]))
+                })
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                modes,
+                [("OFF", "OFF"), ("ON", "OFF"), ("OFF", "ON"), ("ON", "ON")]
+                    .into_iter()
+                    .collect()
+            );
+        }
+
+        let summary = benchmark_phase6_summary_from_tsv(&raw).unwrap();
+        let summary_lines = summary.lines().collect::<Vec<_>>();
+        assert_eq!(summary_lines[0], summary_tsv_header(true));
+        assert_eq!(
+            summary_lines.len() - 1,
+            (cases.len() + 1) * MODE_LABELS.len()
+        );
+        assert!(
+            benchmark_summary_from_tsv(&raw).is_err(),
+            "Phase 4 summary parser must reject Phase 6 corpus rows"
+        );
+
+        let mut incomplete_rows = raw
+            .lines()
+            .map(|line| line.split('\t').map(str::to_string).collect::<Vec<_>>())
             .collect::<Vec<_>>();
-        repair_sets.sort();
-        repair_sets
+        let incomplete_start = 1 + 3 * MODE_LABELS.len();
+        for row in incomplete_rows
+            .iter_mut()
+            .skip(incomplete_start)
+            .take(MODE_LABELS.len())
+        {
+            row[48] = "incomplete_timeout".to_string();
+        }
+        incomplete_rows[incomplete_start][33] = "true".to_string();
+        let incomplete_raw = incomplete_rows
+            .iter()
+            .map(|row| row.join("\t"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let incomplete_summary = benchmark_phase6_summary_from_tsv(&incomplete_raw).unwrap();
+        let incomplete_case_rows = incomplete_summary
+            .lines()
+            .skip(1)
+            .filter(|line| line.starts_with("phase6_missing_close_depth_8\t"))
+            .map(|line| line.split('\t').collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        assert_eq!(incomplete_case_rows.len(), MODE_LABELS.len());
+        assert!(incomplete_case_rows.iter().all(|row| row[36] == "1"));
+    }
+
+    #[test]
+    fn phase6_differential_validation_marks_timeout_incomplete() {
+        let case = CorpusCase {
+            name: "phase6_timeout_test".to_string(),
+            category: "phase6_test",
+            input: "1+*".to_string(),
+            expects_recovery: true,
+        };
+        let completed = DifferentialObservation {
+            minimum_costs: vec![Some(1)],
+            repair_sets: vec![vec!["delete *".to_string()]],
+            timed_out: false,
+        };
+        let mut observations = vec![Some(completed.clone()); MODE_LABELS.len()];
+        assert_eq!(
+            check_differential_equivalence(&case, &observations).unwrap(),
+            DifferentialResult::Equivalent
+        );
+
+        observations[2] = Some(DifferentialObservation {
+            minimum_costs: vec![Some(2)],
+            repair_sets: vec![vec!["different repair".to_string()]],
+            timed_out: true,
+        });
+        assert_eq!(
+            check_differential_equivalence(&case, &observations).unwrap(),
+            DifferentialResult::IncompleteTimeout
+        );
+
+        observations[2] = Some(DifferentialObservation {
+            minimum_costs: vec![Some(2)],
+            repair_sets: vec![vec!["different repair".to_string()]],
+            timed_out: false,
+        });
+        assert!(check_differential_equivalence(&case, &observations).is_err());
     }
 
     #[test]

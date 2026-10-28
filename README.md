@@ -131,6 +131,50 @@ mode is the instrumented vendored CPCT+ implementation with delimiter-aware
 features disabled, not a pristine untouched upstream lrpar baseline. A
 separate pristine-upstream comparison is not part of this harness.
 
+### Phase 6 extended corpus
+
+Phase 6 is a separate, opt-in extension; it does not change the Phase 4
+30-case corpus, defaults, case names, or TSV schemas. Run it explicitly:
+
+```powershell
+cargo run --release -- --benchmark-phase6
+cargo run --release -- --benchmark-phase6 --benchmark-trials 15 --benchmark-warmups 3
+cargo run --release -- --benchmark-phase6-summary
+cargo run --release -- --benchmark-phase6-summary-from results\cpct-phase6-raw.tsv
+```
+
+The Phase 6 benchmark defaults to 15 measured trials and 3 warm-ups. The
+existing `--benchmark-trials N` and `--benchmark-warmups N` options override
+those defaults for this workflow; Phase 4 keeps its 5-trial/1-warm-up defaults.
+One Phase 6 run writes `results/cpct-phase6-raw.tsv` and
+`results/cpct-phase6-summary.tsv`. The summary-only options read a Phase 6 raw
+TSV and write only the summary file. These paths are separate from Phase 4
+outputs. The benchmark is never started implicitly.
+
+The 23 Phase 6 inputs are generated deterministically and validated before
+measurement in all four modes. Coverage includes:
+
+- Valid nesting at depths 64, 128, and 256; missing closing parentheses at
+  depths 8, 16, 32, and 64.
+- Valid expressions and missing-close expressions at 48, 96, and 192 terms.
+- Three mismatches at different nesting levels/positions; three crossed or
+  mixed delimiter patterns; two multi-type unmatched-opening cases.
+- Two long ordinary syntax errors without delimiter imbalance.
+
+Every raw Phase 6 row adds `differential_comparison` to the Phase 4 raw
+instrumentation columns. Completed paired searches are checked against OFF/OFF
+for equal minimum repair costs and equal complete normalized minimum-cost
+repair sets. If any mode in the paired trial times out, all four rows are
+marked `incomplete_timeout`; the summary reports those trials separately and
+does not claim repair-set equivalence for them. The 500 ms non-test CPCT+
+recovery budget is unchanged. Timeout cases are retained as incomplete
+observations rather than removed or treated as completed results.
+
+This larger corpus is intended to expose scaling behavior, not to establish
+runtime improvement by construction. Report search-work counters separately
+from runtime distributions. A lower generated count is not evidence of lower
+runtime, and these experiments do not expose peak memory.
+
 ## Delimiter Observation
 
 The delimiter tracker is a grammar-neutral structural scanner over the raw input

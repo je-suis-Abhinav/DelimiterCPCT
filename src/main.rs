@@ -8,13 +8,16 @@ use DelimiterCPCT::{
 fn main() {
     let mut run_benchmark = false;
     let mut run_benchmark_summary = false;
+    let mut run_phase6_benchmark = false;
+    let mut run_phase6_summary = false;
     let mut observe = false;
     let mut show_recovery_stats = false;
     let mut delimiter_dominance = false;
     let mut delimiter_localization = false;
     let mut benchmark_summary_input = None;
-    let mut benchmark_trials = 5;
-    let mut benchmark_warmups = 1;
+    let mut phase6_summary_input = None;
+    let mut benchmark_trials = None;
+    let mut benchmark_warmups = None;
     let args = env::args().skip(1).collect::<Vec<_>>();
     let mut input_args = Vec::new();
     let mut index = 0;
@@ -23,6 +26,8 @@ fn main() {
         match arg.as_str() {
             "--benchmark" => run_benchmark = true,
             "--benchmark-summary" => run_benchmark_summary = true,
+            "--benchmark-phase6" => run_phase6_benchmark = true,
+            "--benchmark-phase6-summary" => run_phase6_summary = true,
             "--observe-delimiters" => observe = true,
             "--recovery-stats" => show_recovery_stats = true,
             "--delimiter-dominance" => delimiter_dominance = true,
@@ -37,9 +42,9 @@ fn main() {
                     std::process::exit(2);
                 };
                 if arg == "--benchmark-trials" {
-                    benchmark_trials = value;
+                    benchmark_trials = Some(value);
                 } else {
-                    benchmark_warmups = value;
+                    benchmark_warmups = Some(value);
                 }
                 index += 1;
             }
@@ -52,11 +57,60 @@ fn main() {
                 benchmark_summary_input = Some(path.clone());
                 index += 1;
             }
+            "--benchmark-phase6-summary-from" => {
+                let Some(path) = args.get(index + 1) else {
+                    eprintln!("Missing path after {arg}");
+                    std::process::exit(2);
+                };
+                run_phase6_summary = true;
+                phase6_summary_input = Some(path.clone());
+                index += 1;
+            }
             _ => input_args.push(arg.clone()),
         }
         index += 1;
     }
     let input = input_args.join(" ");
+    if run_phase6_benchmark {
+        let trials = benchmark_trials.unwrap_or(DelimiterCPCT::benchmark::PHASE6_DEFAULT_TRIALS);
+        let warmups = benchmark_warmups.unwrap_or(DelimiterCPCT::benchmark::PHASE6_DEFAULT_WARMUPS);
+        let result = DelimiterCPCT::benchmark::benchmark_phase6_tsv_with_trials(trials, warmups)
+            .and_then(|raw| {
+                let summary = DelimiterCPCT::benchmark::benchmark_phase6_summary_from_tsv(&raw)?;
+                fs::create_dir_all("results")
+                    .map_err(|error| format!("could not create results directory: {error}"))?;
+                fs::write("results/cpct-phase6-raw.tsv", raw)
+                    .map_err(|error| format!("could not write Phase 6 raw TSV: {error}"))?;
+                fs::write("results/cpct-phase6-summary.tsv", summary)
+                    .map_err(|error| format!("could not write Phase 6 summary TSV: {error}"))?;
+                Ok(())
+            });
+        if let Err(error) = result {
+            eprintln!("Phase 6 benchmark failed: {error}");
+            std::process::exit(1);
+        }
+        eprintln!("Wrote results/cpct-phase6-raw.tsv and results/cpct-phase6-summary.tsv");
+        return;
+    }
+    if run_phase6_summary {
+        let input_path =
+            phase6_summary_input.unwrap_or_else(|| "results/cpct-phase6-raw.tsv".to_string());
+        let result = fs::read_to_string(&input_path)
+            .map_err(|error| format!("could not read Phase 6 raw TSV {input_path:?}: {error}"))
+            .and_then(|raw| DelimiterCPCT::benchmark::benchmark_phase6_summary_from_tsv(&raw))
+            .and_then(|summary| {
+                fs::create_dir_all("results")
+                    .map_err(|error| format!("could not create results directory: {error}"))?;
+                fs::write("results/cpct-phase6-summary.tsv", summary)
+                    .map_err(|error| format!("could not write Phase 6 summary TSV: {error}"))
+            });
+        if let Err(error) = result {
+            eprintln!("Phase 6 summary failed: {error}");
+            std::process::exit(1);
+        }
+        eprintln!("Wrote results/cpct-phase6-summary.tsv");
+        return;
+    }
     if run_benchmark_summary {
         let summary = if let Some(path) = benchmark_summary_input {
             fs::read_to_string(&path)
@@ -64,8 +118,8 @@ fn main() {
                 .and_then(|raw| DelimiterCPCT::benchmark::benchmark_summary_from_tsv(&raw))
         } else {
             DelimiterCPCT::benchmark::benchmark_summary_tsv_with_trials(
-                benchmark_trials,
-                benchmark_warmups,
+                benchmark_trials.unwrap_or(5),
+                benchmark_warmups.unwrap_or(1),
             )
         };
         match summary {
@@ -79,8 +133,8 @@ fn main() {
     }
     if run_benchmark {
         match DelimiterCPCT::benchmark::benchmark_tsv_with_trials(
-            benchmark_trials,
-            benchmark_warmups,
+            benchmark_trials.unwrap_or(5),
+            benchmark_warmups.unwrap_or(1),
         ) {
             Ok(output) => print!("{output}"),
             Err(error) => {
@@ -104,6 +158,8 @@ fn main() {
         eprintln!(
             "Usage: cargo run -- [--observe-delimiters] [--recovery-stats] [--delimiter-dominance] [--delimiter-localization] \"1+2*3\"\n\
              Benchmark: cargo run --release -- --benchmark [--benchmark-trials N] [--benchmark-warmups N]\n\
+             Phase 6 benchmark: cargo run --release -- --benchmark-phase6 [--benchmark-trials N] [--benchmark-warmups N]\n\
+             Phase 6 summary: cargo run --release -- --benchmark-phase6-summary [--benchmark-phase6-summary-from cpct-phase6-raw.tsv]\n\
              Summary: cargo run --release -- --benchmark-summary-from cpct-raw.tsv"
         );
         return;
